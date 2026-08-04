@@ -36,7 +36,6 @@ TENANT_PATTERN = re.compile(r"^[A-Za-z0-9.-]{1,100}$")
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]{3,50}$")
 TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 VALID_STATUSES = {"active", "pending", "error", "invalid"}
-PUBLIC_MAIL_PAGE_SIZE = 1
 CAPTCHA_TTL_SECONDS = 10 * 60
 PUBLIC_SHARE_HOST = (urlsplit(config.public_share_origin).hostname or "").lower()
 
@@ -434,8 +433,8 @@ def render_public_mail_page(
       <section class="section-heading">
         <div>
           <p class="eyebrow">Inbox view</p>
-          <h1>最新邮件</h1>
-          <p class="lead">这里仅显示该共享邮箱最新收到的一封邮件。</p>
+          <h1>全部邮件</h1>
+          <p class="lead">这里显示该共享邮箱的全部邮件，最新邮件排在前面。</p>
         </div>
         <div class="section-actions">
           <span class="matched-mailbox">邮箱 <strong>{escape(email_address)}</strong></span>
@@ -457,18 +456,29 @@ def formatTimeForHtml(timestamp: Any) -> str:
 
 
 def get_public_mail_result(account: dict[str, Any]) -> dict[str, Any]:
+    owner_id = int(account["owner_id"])
     if account["target_id"]:
-        return store.list_target_archived_messages(
-            int(account["owner_id"]),
-            int(account["target_id"]),
+        target_id = int(account["target_id"])
+        first_page = store.list_target_archived_messages(
+            owner_id,
+            target_id,
             1,
-            PUBLIC_MAIL_PAGE_SIZE,
+            1,
         )
+        return store.list_target_archived_messages(
+            owner_id,
+            target_id,
+            1,
+            max(int(first_page["total"]), 1),
+        )
+
+    account_id = int(account["id"])
+    first_page = store.list_archived_messages(owner_id, account_id, 1, 1)
     return store.list_archived_messages(
-        int(account["owner_id"]),
-        int(account["id"]),
+        owner_id,
+        account_id,
         1,
-        PUBLIC_MAIL_PAGE_SIZE,
+        max(int(first_page["total"]), 1),
     )
 
 
