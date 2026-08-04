@@ -918,15 +918,33 @@ async def list_messages(account_id: int, user: CurrentUser) -> dict[str, object]
     if not account:
         raise HTTPException(status_code=404, detail="邮箱不存在")
 
+    last_mail_at = account["last_mail_at"]
     result = store.list_archived_messages(
         int(user["id"]),
         account_id,
         1,
         int(store.get_settings()["mail_page_size"]),
     )
+
+    # 首次归档尚未完成时，沿用原有的打开收件箱即读取行为，避免迁移后显示为空。
+    if not result["items"] and account["last_archive_sync_at"] is None:
+        try:
+            sync_result = await mail_archive_coordinator.sync_account(account_id)
+        except TokenRefreshError as exc:
+            raise HTTPException(status_code=502, detail=exc.description) from exc
+        except MailboxError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        result = store.list_archived_messages(
+            int(user["id"]),
+            account_id,
+            1,
+            int(store.get_settings()["mail_page_size"]),
+        )
+        last_mail_at = sync_result["last_mail_at"]
+
     return {
         "email": account["email"],
-        "last_mail_at": account["last_mail_at"],
+        "last_mail_at": last_mail_at,
         **result,
     }
 
