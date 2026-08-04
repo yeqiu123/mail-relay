@@ -2582,3 +2582,49 @@ textarea {
   background: #eff6ff;
   color: var(--accent);
 }
+
+#refresh-overlay {
+  z-index: 120;
+}
+
+.refresh-progress {
+  width: min(330px, calc(100vw - 32px));
+  min-height: 190px;
+  padding: 28px 24px;
+  border: 1px solid rgba(191, 219, 254, 0.95);
+  border-radius: 8px;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 24px 60px rgba(37, 99, 235, 0.18), 0 3px 10px rgba(30, 41, 59, 0.10);
+  color: var(--ink);
+  transform: translateY(8px);
+  transition: transform 150ms ease;
+}
+
+.overlay.open .refresh-progress {
+  transform: translateY(0);
+}
+
+.refresh-progress .spinner {
+  width: 32px;
+  height: 32px;
+  border-width: 3px;
+}
+
+.refresh-progress strong {
+  font-size: 15px;
+}
+
+.refresh-progress-count {
+  color: var(--accent);
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.refresh-progress-detail {
+  color: var(--ink-faint);
+  font-size: 12px;
+}

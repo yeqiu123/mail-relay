@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Mail Relay</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260804-modal">
+  <link rel="stylesheet" href="/static/styles.css?v=20260804-refresh-wait">
   <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
-  <script defer src="/static/app.js?v=20260804-status"></script>
+  <script defer src="/static/app.js?v=20260804-refresh-wait"></script>
 </head>
 <body>
   <div class="boot-screen" id="boot-screen" aria-label="正在加载">
@@ -697,6 +697,15 @@
       </article>
     </div>
   </aside>
+
+  <div class="overlay hidden" id="refresh-overlay" aria-hidden="true">
+    <section class="refresh-progress" role="status" aria-live="polite">
+      <span class="spinner"></span>
+      <strong>正在校验邮箱</strong>
+      <span class="refresh-progress-count" id="refresh-loading-count">0 / 0</span>
+      <span class="refresh-progress-detail" id="refresh-loading-detail">正在准备校验</span>
+    </section>
+  </div>
 
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
 </body>

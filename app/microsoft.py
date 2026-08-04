@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -491,6 +493,32 @@ class MailArchiveCoordinator:
         }
 
 
+@dataclass
+class FullRefreshJob:
+    """单次手动完整校验的进度与结果。"""
+
+    id: str
+    owner_id: int
+    total: int
+    completed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+
+    @property
+    def done(self) -> bool:
+        return self.completed >= self.total
+
+    def response(self) -> dict[str, str | int | bool]:
+        return {
+            "id": self.id,
+            "total": self.total,
+            "completed": self.completed,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "done": self.done,
+        }
+
+
 class FullRefreshCoordinator:
     """手动完整校验队列：刷新令牌后必须成功读取收件箱。"""
 
@@ -505,10 +533,17 @@ class FullRefreshCoordinator:
         self.token_service = token_service
         self.mail_archive_coordinator = mail_archive_coordinator
         self.worker_count = worker_count
-        self.queue: asyncio.Queue[int] = asyncio.Queue()
-        self._queued_ids: set[int] = set()
-        self._queued_lock = asyncio.Lock()
+        self.queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+        self._jobs: dict[str, FullRefreshJob] = {}
+        self._account_locks: dict[int, asyncio.Lock] = {}
         self._tasks: list[asyncio.Task[Any]] = []
+
+    def _lock_for(self, account_id: int) -> asyncio.Lock:
+        lock = self._account_locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._account_locks[account_id] = lock
+        return lock
 
     async def start(self) -> None:
         self._tasks = [
@@ -525,25 +560,47 @@ class FullRefreshCoordinator:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-    async def enqueue(self, account_ids: list[int]) -> int:
-        queued = 0
-        async with self._queued_lock:
+    def start_job(
+        self,
+        owner_id: int,
+        account_ids: list[int],
+    ) -> dict[str, str | int | bool]:
+        job = FullRefreshJob(
+            id=uuid.uuid4().hex,
+            owner_id=owner_id,
+            total=len(account_ids),
+        )
+        self._jobs[job.id] = job
+        if account_ids:
+            self.store.mark_full_refresh_pending(account_ids)
             for account_id in account_ids:
-                if account_id in self._queued_ids:
-                    continue
-                self._queued_ids.add(account_id)
-                self.queue.put_nowait(account_id)
-                queued += 1
-        return queued
+                self.queue.put_nowait((job.id, account_id))
+        return job.response()
+
+    def get_job(
+        self,
+        owner_id: int,
+        job_id: str,
+    ) -> dict[str, str | int | bool] | None:
+        job = self._jobs.get(job_id)
+        if not job or job.owner_id != owner_id:
+            return None
+        return job.response()
 
     async def _worker(self, index: int) -> None:
         del index
         while True:
-            account_id = await self.queue.get()
+            job_id, account_id = await self.queue.get()
+            job = self._jobs.get(job_id)
+            succeeded = False
             try:
-                await self.token_service.refresh_account(account_id)
-                await self.mail_archive_coordinator.sync_account(account_id)
-                self.store.mark_full_refresh_succeeded(account_id)
+                if not job:
+                    continue
+                async with self._lock_for(account_id):
+                    await self.token_service.refresh_account(account_id)
+                    await self.mail_archive_coordinator.sync_account(account_id)
+                    self.store.mark_full_refresh_succeeded(account_id)
+                    succeeded = True
             except TokenRefreshError as exc:
                 self.store.mark_full_refresh_failure(account_id, exc.description)
             except MailboxError as exc:
@@ -558,8 +615,12 @@ class FullRefreshCoordinator:
                     f"internal_error: {exc.__class__.__name__}",
                 )
             finally:
-                async with self._queued_lock:
-                    self._queued_ids.discard(account_id)
+                if job:
+                    job.completed += 1
+                    if succeeded:
+                        job.succeeded += 1
+                    else:
+                        job.failed += 1
                 self.queue.task_done()
 
     def status(self) -> dict[str, int]:

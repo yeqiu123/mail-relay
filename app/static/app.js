@@ -27,6 +27,7 @@ const state = {
   oauthClientId: "",
   oauthFlowId: "",
   confirmResolve: null,
+  refreshing: false,
 };
 
 const viewMeta = {
@@ -510,21 +511,66 @@ function toggleSelectAll(checked) {
   updateSelectionUi();
 }
 
-async function queueRefresh(ids) {
-  const button = $("#refresh-button");
-  setButtonBusy(button, true, "加入队列");
+function updateRefreshLoading(job) {
+  if (job.preparing) {
+    $("#refresh-loading-count").textContent = "--";
+    $("#refresh-loading-detail").textContent = "正在准备校验";
+    return;
+  }
+  const total = Number(job.total || 0);
+  const completed = Number(job.completed || 0);
+  const succeeded = Number(job.succeeded || 0);
+  const failed = Number(job.failed || 0);
+  $("#refresh-loading-count").textContent = `${completed} / ${total}`;
+  $("#refresh-loading-detail").textContent = total
+    ? `正常 ${succeeded} 个 · 异常 ${failed} 个`
+    : "没有可校验邮箱";
+}
+
+function showRefreshLoading(job) {
+  updateRefreshLoading(job);
+  showOverlay($("#refresh-overlay"), true);
+}
+
+function hideRefreshLoading() {
+  showOverlay($("#refresh-overlay"), false);
+}
+
+async function waitForRefreshJob(job) {
+  let current = job;
+  while (!current.done) {
+    await new Promise((resolve) => window.setTimeout(resolve, 650));
+    current = await api(`/api/refresh-jobs/${encodeURIComponent(current.id)}`);
+    updateRefreshLoading(current);
+  }
+  return current;
+}
+
+async function queueRefresh(ids, { button = $("#refresh-button"), reloadMailbox = false } = {}) {
+  if (state.refreshing) return;
+  state.refreshing = true;
+  showRefreshLoading({ preparing: true });
+  setButtonBusy(button, true, "校验中");
   try {
-    const result = await api("/api/accounts/refresh", {
+    const started = await api("/api/accounts/refresh", {
       method: "POST",
       body: JSON.stringify({ ids }),
     });
-    toast(`已加入邮箱校验队列：${result.queued} 个`);
-    window.setTimeout(() => {
-      if (state.view === "accounts") loadAccounts();
-    }, 1600);
+    updateRefreshLoading(started);
+    const result = await waitForRefreshJob(started);
+    if (state.view === "accounts") await loadAccounts();
+    if (reloadMailbox && state.mailAccount && ids.includes(state.mailAccount.id)) {
+      await loadMailbox();
+    }
+    const message = result.total
+      ? `校验完成：正常 ${result.succeeded} 个，异常 ${result.failed} 个`
+      : "没有可校验邮箱";
+    toast(message, result.failed ? "error" : "success");
   } catch (error) {
     if (!error.authExpired) toast(error.message, "error");
   } finally {
+    hideRefreshLoading();
+    state.refreshing = false;
     setButtonBusy(button, false);
     updateSelectionUi();
   }
@@ -1322,20 +1368,18 @@ function closeDrawer() {
   window.setTimeout(() => $("#drawer-scrim").classList.add("hidden"), 180);
 }
 
-async function loadMailbox(refresh = false) {
+async function loadMailbox() {
   const account = state.mailAccount;
   if (!account) return;
   const mailList = $("#mail-list");
   mailList.innerHTML = `
     <div class="mail-list-state">
       <span class="spinner"></span>
-      <span>${refresh ? "正在刷新收件箱" : "正在加载已归档邮件"}</span>
+      <span>正在加载已归档邮件</span>
     </div>
   `;
   try {
-    const result = refresh
-      ? await api(`/api/accounts/${account.id}/messages/sync`, { method: "POST" })
-      : await api(`/api/accounts/${account.id}/messages`);
+    const result = await api(`/api/accounts/${account.id}/messages`);
     if (!state.mailAccount || state.mailAccount.id !== account.id) return;
     if (result.last_mail_at) {
       state.mailAccount.last_mail_at = result.last_mail_at;
@@ -1495,7 +1539,7 @@ function bindEvents() {
     if (button.dataset.action === "copy-email") copyEmailAddress(account.email);
     if (button.dataset.action === "mail") openDrawer(account);
     if (button.dataset.action === "share") generateShareLink(id);
-    if (button.dataset.action === "refresh") queueRefresh([id]);
+    if (button.dataset.action === "refresh") queueRefresh([id], { button });
     if (button.dataset.action === "delete") deleteAccounts([id]);
   });
   $("#share-button").addEventListener("click", () => {
@@ -1506,7 +1550,9 @@ function bindEvents() {
     }
     generateShareLink(ids[0]);
   });
-  $("#refresh-button").addEventListener("click", () => queueRefresh(Array.from(state.selected)));
+  $("#refresh-button").addEventListener("click", (event) => {
+    queueRefresh(Array.from(state.selected), { button: event.currentTarget });
+  });
   $("#delete-button").addEventListener("click", () => deleteAccounts(Array.from(state.selected)));
   $("#export-button").addEventListener("click", exportAccounts);
 
@@ -1584,7 +1630,14 @@ function bindEvents() {
 
   $("#close-drawer").addEventListener("click", closeDrawer);
   $("#drawer-scrim").addEventListener("click", closeDrawer);
-  $("#reload-mail").addEventListener("click", () => loadMailbox(true));
+  $("#reload-mail").addEventListener("click", (event) => {
+    if (state.mailAccount) {
+      queueRefresh([state.mailAccount.id], {
+        button: event.currentTarget,
+        reloadMailbox: true,
+      });
+    }
+  });
   $("#drawer-email").addEventListener("click", (event) => {
     copyEmailAddress(event.currentTarget.dataset.email || "");
   });

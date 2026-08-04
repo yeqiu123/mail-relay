@@ -746,11 +746,17 @@ async def import_accounts(
 async def refresh_accounts(
     payload: AccountIdsPayload,
     user: CurrentUser,
-) -> dict[str, int]:
+) -> dict[str, str | int | bool]:
     account_ids = store.refreshable_ids(int(user["id"]), payload.ids or None)
-    store.mark_full_refresh_pending(account_ids)
-    queued = await full_refresh_coordinator.enqueue(account_ids)
-    return {"matched": len(account_ids), "queued": queued}
+    return full_refresh_coordinator.start_job(int(user["id"]), account_ids)
+
+
+@app.get("/api/refresh-jobs/{job_id}")
+async def get_refresh_job(job_id: str, user: CurrentUser) -> dict[str, str | int | bool]:
+    job = full_refresh_coordinator.get_job(int(user["id"]), job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="刷新任务不存在")
+    return job
 
 
 @app.delete("/api/accounts")
