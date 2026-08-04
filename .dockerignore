@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data/
+.local-data/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.git/
+*.log
+*.tar.gz
+mail-relay-*.tar.gz
+scratch/
+.claude/
+prototype-v0.html

@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Mail Relay</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <div class="boot-screen" id="boot-screen" aria-label="正在加载">
+    <span class="spinner"></span>
+  </div>
+
+  <main class="login-view hidden" id="login-view">
+    <section class="login-panel">
+      <div class="login-brand">
+        <span class="brand-mark">MR</span>
+        <span>Mail Relay</span>
+      </div>
+      <div class="login-copy">
+        <p class="eyebrow">ACCOUNT CONSOLE</p>
+        <h1>登录邮箱后台</h1>
+        <p>Outlook 邮箱批量管理与收件箱</p>
+      </div>
+      <form class="login-form" id="login-form">
+        <label class="field">
+          <span>账号</span>
+          <span class="input-shell">
+            <i data-lucide="user-round"></i>
+            <input id="login-username" name="username" autocomplete="username" required>
+          </span>
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <span class="input-shell">
+            <i data-lucide="lock-keyhole"></i>
+            <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+          </span>
+        </label>
+        <p class="form-error hidden" id="login-error" role="alert"></p>
+        <button class="button primary login-button" type="submit">
+          <span>登录</span>
+          <i data-lucide="arrow-right"></i>
+        </button>
+      </form>
+    </section>
+    <div class="login-aside" aria-hidden="true">
+      <div class="signal-board">
+        <div class="signal-head">
+          <span>Microsoft OAuth</span>
+          <span class="live-dot">ONLINE</span>
+        </div>
+        <div class="signal-lines">
+          <span style="--width: 82%"></span>
+          <span style="--width: 64%"></span>
+          <span style="--width: 91%"></span>
+          <span style="--width: 48%"></span>
+          <span style="--width: 73%"></span>
+        </div>
+        <div class="signal-foot">
+          <span>IMAP / XOAUTH2</span>
+          <span>TLS 993</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="app-shell hidden" id="app-shell">
+    <div class="sidebar-scrim" id="sidebar-scrim"></div>
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="brand-mark">MR</span>
+        <span>Mail Relay</span>
+        <button class="icon-button sidebar-close" id="sidebar-close" type="button" aria-label="关闭菜单" title="关闭菜单">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <p class="nav-label">工作台</p>
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" type="button" data-view="accounts">
+          <i data-lucide="inbox"></i>
+          <span>邮箱管理</span>
+        </button>
+        <button class="nav-item" type="button" data-view="logs">
+          <i data-lucide="history"></i>
+          <span>刷新记录</span>
+        </button>
+        <button class="nav-item hidden" id="users-nav" type="button" data-view="users">
+          <i data-lucide="users"></i>
+          <span>用户管理</span>
+        </button>
+        <button class="nav-item hidden" id="settings-nav" type="button" data-view="settings">
+          <i data-lucide="settings-2"></i>
+          <span>系统设置</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="session-user">
+          <i data-lucide="circle-user-round"></i>
+          <span>
+            <strong id="current-username"></strong>
+            <small id="current-role"></small>
+          </span>
+        </div>
+        <div class="service-status">
+          <span class="service-indicator"></span>
+          <span>
+            <strong>自动刷新服务</strong>
+            <small id="service-detail">正在连接</small>
+          </span>
+        </div>
+        <button class="logout-button" id="logout-button" type="button">
+          <i data-lucide="log-out"></i>
+          <span>退出登录</span>
+        </button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-title">
+          <button class="icon-button mobile-menu" id="mobile-menu" type="button" aria-label="打开菜单" title="打开菜单">
+            <i data-lucide="menu"></i>
+          </button>
+          <div>
+            <h1 id="page-title">邮箱管理</h1>
+            <p id="page-subtitle">Outlook 账号与收件箱管理</p>
+          </div>
+        </div>
+        <div class="top-actions" id="account-top-actions">
+          <button class="button" id="export-button" type="button">
+            <i data-lucide="download"></i>
+            <span>导出</span>
+          </button>
+          <button class="button primary" id="open-import" type="button">
+            <i data-lucide="upload"></i>
+            <span>批量导入</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="view" id="accounts-view">
+        <div class="metrics" aria-label="邮箱统计">
+          <div class="metric">
+            <span class="metric-label">邮箱总数</span>
+            <strong id="metric-total">0</strong>
+            <small>全部邮箱</small>
+          </div>
+          <div class="metric">
+            <span class="metric-label">可读取</span>
+            <strong id="metric-active">0</strong>
+            <small>可读取邮件</small>
+          </div>
+          <div class="metric">
+            <span class="metric-label">待刷新</span>
+            <strong id="metric-pending">0</strong>
+            <small>等待后台处理</small>
+          </div>
+          <div class="metric">
+            <span class="metric-label">失效账号</span>
+            <strong id="metric-invalid">0</strong>
+            <small>需要重新授权</small>
+          </div>
+        </div>
+
+        <section class="workspace">
+          <div class="toolbar">
+            <div class="toolbar-left">
+              <label class="search-box">
+                <i data-lucide="search"></i>
+                <input id="account-search" type="search" placeholder="搜索邮箱" autocomplete="off">
+                <button class="search-clear hidden" id="search-clear" type="button" aria-label="清除搜索" title="清除搜索">
+                  <i data-lucide="x"></i>
+                </button>
+              </label>
+              <select class="select-control" id="status-filter" aria-label="状态筛选">
+                <option value="">全部状态</option>
+                <option value="active">令牌正常</option>
+                <option value="pending">待刷新</option>
+                <option value="error">刷新异常</option>
+                <option value="invalid">已失效</option>
+              </select>
+            </div>
+            <div class="toolbar-right">
+              <span class="selection-count hidden" id="selection-count"></span>
+              <button class="button" id="share-button" type="button" disabled>
+                <i data-lucide="link"></i>
+                <span>生成链接</span>
+              </button>
+              <button class="button" id="refresh-button" type="button">
+                <i data-lucide="rotate-cw"></i>
+                <span>刷新全部</span>
+              </button>
+              <button class="icon-button danger-action" id="delete-button" type="button" aria-label="删除所选" title="删除所选" disabled>
+                <i data-lucide="trash-2"></i>
+              </button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="data-table account-table">
+              <colgroup>
+                <col class="col-check">
+                <col class="col-email">
+                <col class="col-status">
+                <col class="col-time">
+                <col class="col-time">
+                <col class="col-time-small">
+                <col class="col-actions">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th><input class="checkbox" id="select-all" type="checkbox" aria-label="选择当前页全部邮箱"></th>
+                  <th>邮箱</th>
+                  <th>状态</th>
+                  <th>上次刷新</th>
+                  <th>下次刷新</th>
+                  <th>最近读取</th>
+                  <th><span class="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody id="account-tbody"></tbody>
+            </table>
+          </div>
+          <footer class="table-footer">
+            <span id="account-total">共 0 个邮箱</span>
+            <nav class="pagination" id="account-pagination" aria-label="邮箱分页"></nav>
+          </footer>
+        </section>
+      </section>
+
+      <section class="view hidden" id="logs-view">
+        <section class="workspace">
+          <div class="section-bar">
+            <div>
+              <h2>令牌刷新记录</h2>
+              <p>按执行时间倒序排列</p>
+            </div>
+            <button class="icon-button" id="reload-logs" type="button" aria-label="重新加载" title="重新加载">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+          </div>
+          <div class="table-wrap logs-table-wrap">
+            <table class="data-table logs-table">
+              <colgroup>
+                <col class="log-email">
+                <col class="log-result">
+                <col class="log-message">
+                <col class="log-time">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>邮箱</th>
+                  <th>结果</th>
+                  <th>详情</th>
+                  <th>执行时间</th>
+                </tr>
+              </thead>
+              <tbody id="logs-tbody"></tbody>
+            </table>
+          </div>
+          <footer class="table-footer">
+            <span id="logs-total">共 0 条记录</span>
+            <nav class="pagination" id="logs-pagination" aria-label="刷新记录分页"></nav>
+          </footer>
+        </section>
+      </section>
+
+      <section class="view hidden" id="settings-view">
+        <section class="settings-layout">
+          <div class="settings-index">
+            <span>OAuth 与收件箱</span>
+            <small>Microsoft 连接参数</small>
+          </div>
+          <form class="settings-form" id="settings-form">
+            <div class="form-section">
+              <div class="form-section-title">
+                <h2>Microsoft OAuth</h2>
+                <p>令牌轮换使用的租户与周期</p>
+              </div>
+              <label class="field">
+                <span>租户</span>
+                <input class="text-control" id="setting-tenant" name="tenant" required maxlength="100">
+              </label>
+              <label class="field">
+                <span>刷新周期</span>
+                <span class="number-field">
+                  <input class="text-control" id="setting-refresh-days" name="refresh_interval_days" type="number" min="1" max="30" required>
+                  <small>天</small>
+                </span>
+              </label>
+            </div>
+            <div class="form-section">
+              <div class="form-section-title">
+                <h2>收件箱</h2>
+                <p>单次读取的最新邮件数量</p>
+              </div>
+              <label class="field">
+                <span>邮件数量</span>
+                <span class="number-field">
+                  <input class="text-control" id="setting-mail-size" name="mail_page_size" type="number" min="10" max="100" required>
+                  <small>封</small>
+                </span>
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button class="button primary" type="submit">
+                <i data-lucide="save"></i>
+                <span>保存设置</span>
+              </button>
+            </div>
+          </form>
+        </section>
+      </section>
+
+      <section class="view hidden" id="users-view">
+        <section class="workspace">
+          <div class="section-bar">
+            <div>
+              <h2>用户管理</h2>
+              <p>账号状态与邮箱数据归属</p>
+            </div>
+            <button class="button primary" id="open-user-modal" type="button">
+              <i data-lucide="user-plus"></i>
+              <span>添加用户</span>
+            </button>
+          </div>
+          <div class="table-wrap users-table-wrap">
+            <table class="data-table users-table">
+              <colgroup>
+                <col class="user-name-column">
+                <col class="user-role-column">
+                <col class="user-status-column">
+                <col class="user-count-column">
+                <col class="user-time-column">
+                <col class="user-actions-column">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>用户名</th>
+                  <th>角色</th>
+                  <th>状态</th>
+                  <th>邮箱数量</th>
+                  <th>创建时间</th>
+                  <th><span class="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody id="users-tbody"></tbody>
+            </table>
+          </div>
+          <footer class="table-footer">
+            <span id="users-total">共 0 个用户</span>
+          </footer>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div class="overlay hidden" id="import-overlay" aria-hidden="true">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="import-title">
+      <header class="modal-head">
+        <div>
+          <h2 id="import-title">批量导入邮箱</h2>
+          <p>请按每行一个格式填入 Outlook 四段凭据</p>
+        </div>
+        <button class="icon-button close-import" type="button" aria-label="关闭" title="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <form id="import-form">
+        <div class="modal-body">
+          <label class="field" for="account-lines">
+            <span>邮箱账号</span>
+            <textarea id="account-lines" placeholder="email----password----client_id----refresh_token" required></textarea>
+          </label>
+          <div class="format-strip">
+            <i data-lucide="shield-check"></i>
+            <span>密码与令牌加密存储</span>
+            <strong id="import-line-count">0 行</strong>
+          </div>
+        </div>
+        <footer class="modal-foot">
+          <button class="button close-import" type="button">取消</button>
+          <button class="button primary" type="submit">
+            <i data-lucide="upload"></i>
+            <span>开始导入</span>
+          </button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="confirm-overlay" aria-hidden="true">
+    <section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="confirm-icon"><i data-lucide="trash-2"></i></div>
+      <h2 id="confirm-title">删除邮箱</h2>
+      <p id="confirm-message"></p>
+      <div class="confirm-actions">
+        <button class="button" id="confirm-cancel" type="button">取消</button>
+        <button class="button danger" id="confirm-submit" type="button">确认删除</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="share-overlay" aria-hidden="true">
+    <section class="modal share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title">
+      <header class="modal-head">
+        <div>
+          <h2 id="share-title">共享邮件链接</h2>
+          <p id="share-email"></p>
+        </div>
+        <button class="icon-button close-share" type="button" aria-label="关闭" title="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="modal-body">
+        <label class="field" for="share-link-input">
+          <span>访问链接</span>
+          <div class="share-link-row">
+            <input class="text-control" id="share-link-input" readonly>
+            <button class="button primary" id="copy-share-link" type="button">
+              <i data-lucide="copy"></i>
+              <span>复制</span>
+            </button>
+          </div>
+        </label>
+      </div>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="user-overlay" aria-hidden="true">
+    <section class="modal user-modal" role="dialog" aria-modal="true" aria-labelledby="user-modal-title">
+      <header class="modal-head">
+        <div>
+          <h2 id="user-modal-title">添加用户</h2>
+          <p id="user-modal-subtitle">新用户登录后只能查看自己的邮箱数据</p>
+        </div>
+        <button class="icon-button close-user-modal" type="button" aria-label="关闭" title="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <form id="user-form">
+        <div class="modal-body user-form-body">
+          <label class="field" id="user-name-field">
+            <span>用户名</span>
+            <input class="text-control" id="user-name-input" autocomplete="off" minlength="3" maxlength="50" required>
+          </label>
+          <label class="field">
+            <span id="user-password-label">初始密码</span>
+            <input class="text-control" id="user-password-input" type="password" autocomplete="new-password" minlength="8" maxlength="200" required>
+          </label>
+        </div>
+        <footer class="modal-foot">
+          <button class="button close-user-modal" type="button">取消</button>
+          <button class="button primary" type="submit">
+            <i data-lucide="user-plus"></i>
+            <span id="user-submit-label">添加用户</span>
+          </button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="drawer-scrim hidden" id="drawer-scrim"></div>
+  <aside class="mail-drawer" id="mail-drawer" aria-hidden="true">
+    <header class="drawer-head">
+      <div class="drawer-title">
+        <span>收件箱</span>
+        <button class="drawer-email-copy" id="drawer-email" type="button" aria-label="复制邮箱地址" title="点击复制邮箱地址">
+          <strong></strong>
+          <i data-lucide="copy"></i>
+        </button>
+      </div>
+      <div class="drawer-actions">
+        <button class="icon-button" id="reload-mail" type="button" aria-label="重新加载收件箱" title="重新加载收件箱">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+        <button class="icon-button" id="close-drawer" type="button" aria-label="关闭" title="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+    </header>
+    <div class="mail-layout">
+      <div class="mail-list" id="mail-list"></div>
+      <article class="mail-content" id="mail-content">
+        <div class="empty-state compact">
+          <i data-lucide="mail-open"></i>
+          <strong>选择一封邮件</strong>
+        </div>
+      </article>
+    </div>
+  </aside>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+</body>
+</html>

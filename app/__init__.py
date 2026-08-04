@@ -1,0 +1,1 @@
+"""Mail Relay application package."""
