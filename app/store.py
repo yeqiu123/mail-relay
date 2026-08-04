@@ -236,6 +236,33 @@ class Store:
         )
 
     @staticmethod
+    def _create_oauth_device_flows_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oauth_device_flows (
+                id                         TEXT PRIMARY KEY,
+                owner_id                   INTEGER NOT NULL,
+                email                      TEXT NOT NULL COLLATE NOCASE,
+                client_id                  TEXT NOT NULL,
+                tenant                     TEXT NOT NULL,
+                device_code_cipher         TEXT,
+                verification_uri           TEXT NOT NULL,
+                verification_uri_complete  TEXT,
+                user_code                  TEXT NOT NULL,
+                expires_at                 INTEGER NOT NULL,
+                interval_seconds           INTEGER NOT NULL,
+                status                     TEXT NOT NULL DEFAULT 'pending',
+                account_id                 INTEGER,
+                last_error                 TEXT,
+                created_at                 INTEGER NOT NULL,
+                updated_at                 INTEGER NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+            )
+            """
+        )
+
+    @staticmethod
     def _ensure_share_link_columns(connection: sqlite3.Connection) -> None:
         for table in ("share_links", "target_share_links"):
             columns = Store._columns(connection, table)
@@ -424,6 +451,7 @@ class Store:
             self._create_target_share_links_table(connection)
             self._create_mail_tags_table(connection)
             self._create_mail_target_tags_table(connection)
+            self._create_oauth_device_flows_table(connection)
             self._ensure_share_link_columns(connection)
             connection.executescript(
                 """
@@ -453,6 +481,8 @@ class Store:
                     ON mail_tags(owner_id, name);
                 CREATE INDEX IF NOT EXISTS idx_mail_target_tags_tag
                     ON mail_target_tags(tag_id, target_id);
+                CREATE INDEX IF NOT EXISTS idx_oauth_device_flows_owner
+                    ON oauth_device_flows(owner_id, created_at DESC);
                 """
             )
             connection.executemany(
@@ -640,6 +670,7 @@ class Store:
                     """,
                     (owner_id, record["email"]),
                 ).fetchone()
+                has_password = "password" in record
                 encrypted_password = self.vault.encrypt(record.get("password", ""))
                 encrypted_refresh = self.vault.encrypt(record.get("refresh_token", ""))
 
@@ -648,13 +679,16 @@ class Store:
                     connection.execute(
                         """
                         UPDATE accounts
-                        SET provider = 'outlook', icloud_alias = NULL, password_cipher = ?, client_id = ?, refresh_token_cipher = ?,
+                        SET provider = 'outlook', icloud_alias = NULL,
+                            password_cipher = CASE WHEN ? THEN ? ELSE password_cipher END,
+                            client_id = ?, refresh_token_cipher = ?,
                             access_token_cipher = NULL, access_expires_at = NULL,
                             status = 'pending', last_refresh_at = NULL,
                             next_refresh_at = ?, last_error = NULL, updated_at = ?
                         WHERE id = ? AND owner_id = ?
                         """,
                         (
+                            1 if has_password else 0,
                             encrypted_password,
                             record.get("client_id", ""),
                             encrypted_refresh,
@@ -1088,6 +1122,100 @@ class Store:
                     (target_id, tag_id),
                 )
         return normalized_tags
+
+    def create_oauth_device_flow(
+        self,
+        owner_id: int,
+        email_address: str,
+        client_id: str,
+        tenant: str,
+        device_code: str,
+        user_code: str,
+        verification_uri: str,
+        verification_uri_complete: str | None,
+        expires_in: int,
+        interval_seconds: int,
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        flow_id = str(uuid.uuid4())
+        expires_at = now + max(60, expires_in)
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM oauth_device_flows WHERE expires_at < ?",
+                (now - 86400,),
+            )
+            connection.execute(
+                """
+                INSERT INTO oauth_device_flows(
+                    id, owner_id, email, client_id, tenant, device_code_cipher,
+                    verification_uri, verification_uri_complete, user_code,
+                    expires_at, interval_seconds, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    flow_id,
+                    owner_id,
+                    email_address,
+                    client_id,
+                    tenant,
+                    self.vault.encrypt(device_code),
+                    verification_uri,
+                    verification_uri_complete,
+                    user_code,
+                    expires_at,
+                    max(1, interval_seconds),
+                    now,
+                    now,
+                ),
+            )
+        return {
+            "id": flow_id,
+            "email": email_address,
+            "verification_uri": verification_uri,
+            "verification_uri_complete": verification_uri_complete,
+            "user_code": user_code,
+            "expires_at": expires_at,
+            "interval_seconds": max(1, interval_seconds),
+        }
+
+    def get_oauth_device_flow(
+        self,
+        owner_id: int,
+        flow_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM oauth_device_flows
+                WHERE id = ? AND owner_id = ?
+                """,
+                (flow_id, owner_id),
+            ).fetchone()
+        if not row:
+            return None
+        flow = dict(row)
+        flow["device_code"] = self.vault.decrypt(row["device_code_cipher"])
+        return flow
+
+    def finish_oauth_device_flow(
+        self,
+        owner_id: int,
+        flow_id: str,
+        status: str,
+        account_id: int | None = None,
+        error: str | None = None,
+    ) -> bool:
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE oauth_device_flows
+                SET status = ?, account_id = ?, last_error = ?, device_code_cipher = NULL,
+                    updated_at = ?
+                WHERE id = ? AND owner_id = ?
+                """,
+                (status, account_id, (error or "")[:600] or None, int(time.time()), flow_id, owner_id),
+            )
+        return cursor.rowcount > 0
 
     def set_mail_target_enabled(
         self,

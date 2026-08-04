@@ -7,6 +7,7 @@ Mail Relay is a self-hosted Outlook mailbox management service with encrypted cr
 - Import Outlook accounts in bulk using `email----password----client_id----refresh_token`.
 - Refresh Microsoft OAuth refresh tokens on a configurable schedule and store the latest token.
 - Read mailbox messages through IMAP with XOAUTH2 authentication.
+- Add an Outlook account through Microsoft device authorization with an Azure application client ID.
 - Isolate mailbox data, messages, exports, and refresh logs between users.
 - Define hidden-mail aliases under each Outlook account, filter archived messages by the recipient address, and create a protected public link for each alias.
 - Group aliases with tags and search them by alias, mailbox, or tag from the management view.
@@ -22,6 +23,14 @@ The public share domain is configured with `PUBLIC_SHARE_ORIGIN`. The main manag
 Shared links can be configured with an expiry period or revoked immediately. Expired and revoked tokens no longer expose mailbox content.
 
 Responses include a restrictive content security policy and standard browser security headers.
+
+## Microsoft Device Authorization
+
+Register or use a Microsoft Entra application that permits public client and device-code flows, with delegated `IMAP.AccessAsUser.All` and `offline_access` permissions. In Mail Relay, choose **Authorization Add**, enter the Outlook address and that application's client ID, then complete the code on the Microsoft page.
+
+The device code is encrypted in SQLite while it is pending and is cleared after authorization completes or fails. It is intended only for the person who owns the mailbox; do not share an authorization code with anyone else.
+
+New accounts created through device authorization export an empty password field because IMAP XOAUTH2 uses the OAuth tokens instead of the Outlook password.
 
 ## Getting Started
 

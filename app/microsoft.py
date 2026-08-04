@@ -19,6 +19,13 @@ class TokenRefreshError(RuntimeError):
         self.permanent = permanent
 
 
+class DeviceAuthorizationError(RuntimeError):
+    def __init__(self, code: str, description: str) -> None:
+        super().__init__(description)
+        self.code = code
+        self.description = description
+
+
 class MicrosoftTokenService:
     def __init__(self, store: Store, config: AppConfig) -> None:
         self.store = store
@@ -32,6 +39,95 @@ class MicrosoftTokenService:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    async def start_device_authorization(
+        self,
+        tenant: str,
+        client_id: str,
+    ) -> dict[str, Any]:
+        endpoint = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode"
+        try:
+            response = await self._client.post(
+                endpoint,
+                data={"client_id": client_id, "scope": self.config.token_scope},
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            raise DeviceAuthorizationError(
+                "network_error", f"Microsoft 连接失败：{exc.__class__.__name__}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if response.status_code >= 400:
+            code = str(payload.get("error") or f"http_{response.status_code}")
+            description = str(
+                payload.get("error_description")
+                or payload.get("error")
+                or f"Microsoft 返回 HTTP {response.status_code}"
+            )
+            raise DeviceAuthorizationError(code, " ".join(description.split())[:600])
+
+        device_code = str(payload.get("device_code") or "")
+        user_code = str(payload.get("user_code") or "")
+        verification_uri = str(payload.get("verification_uri") or "")
+        if not device_code or not user_code or not verification_uri:
+            raise DeviceAuthorizationError("invalid_response", "Microsoft 响应中缺少设备授权信息")
+        return {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": verification_uri,
+            "verification_uri_complete": str(payload.get("verification_uri_complete") or "") or None,
+            "expires_in": max(60, int(payload.get("expires_in") or 900)),
+            "interval": max(1, int(payload.get("interval") or 5)),
+        }
+
+    async def complete_device_authorization(
+        self,
+        tenant: str,
+        client_id: str,
+        device_code: str,
+    ) -> dict[str, Any]:
+        endpoint = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+        try:
+            response = await self._client.post(
+                endpoint,
+                data={
+                    "client_id": client_id,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": device_code,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            raise DeviceAuthorizationError(
+                "network_error", f"Microsoft 连接失败：{exc.__class__.__name__}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if response.status_code >= 400:
+            code = str(payload.get("error") or f"http_{response.status_code}")
+            description = str(
+                payload.get("error_description")
+                or payload.get("error")
+                or f"Microsoft 返回 HTTP {response.status_code}"
+            )
+            raise DeviceAuthorizationError(code, " ".join(description.split())[:600])
+
+        access_token = str(payload.get("access_token") or "")
+        refresh_token = str(payload.get("refresh_token") or "")
+        if not access_token or not refresh_token:
+            raise DeviceAuthorizationError("invalid_response", "Microsoft 响应中缺少访问令牌或刷新令牌")
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": max(300, int(payload.get("expires_in") or 3600)),
+        }
 
     def _lock_for(self, account_id: int) -> asyncio.Lock:
         lock = self._locks.get(account_id)

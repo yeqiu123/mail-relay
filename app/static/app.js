@@ -24,6 +24,8 @@ const state = {
   shareToken: "",
   shareExpiresAt: null,
   shareLastAccessAt: null,
+  oauthClientId: "",
+  oauthFlowId: "",
   confirmResolve: null,
 };
 
@@ -947,6 +949,76 @@ function closeImport() {
   showOverlay($("#import-overlay"), false);
 }
 
+function openOAuthModal() {
+  state.oauthFlowId = "";
+  $("#oauth-email-input").value = "";
+  $("#oauth-client-id-input").value = state.oauthClientId;
+  $("#oauth-start-form").classList.remove("hidden");
+  $("#oauth-device-panel").classList.add("hidden");
+  $("#oauth-verification-uri").value = "";
+  $("#oauth-user-code").value = "";
+  $("#oauth-open-link").removeAttribute("href");
+  $("#oauth-device-status").textContent = "";
+  showOverlay($("#oauth-overlay"), true);
+  window.setTimeout(() => $("#oauth-email-input").focus(), 80);
+}
+
+function closeOAuthModal() {
+  showOverlay($("#oauth-overlay"), false);
+}
+
+async function startOAuthDeviceAuthorization(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  setButtonBusy(button, true, "获取中");
+  try {
+    const clientId = $("#oauth-client-id-input").value.trim();
+    const result = await api("/api/oauth/device", {
+      method: "POST",
+      body: JSON.stringify({
+        email: $("#oauth-email-input").value.trim(),
+        client_id: clientId,
+      }),
+    });
+    state.oauthClientId = clientId;
+    state.oauthFlowId = String(result.id || "");
+    $("#oauth-start-form").classList.add("hidden");
+    $("#oauth-device-panel").classList.remove("hidden");
+    $("#oauth-verification-uri").value = result.verification_uri || "";
+    $("#oauth-user-code").value = result.user_code || "";
+    $("#oauth-open-link").href = result.verification_uri_complete || result.verification_uri || "#";
+    $("#oauth-device-status").textContent = `授权码有效至 ${formatTime(result.expires_at)}`;
+    refreshIcons($("#oauth-device-panel"));
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function completeOAuthDeviceAuthorization() {
+  if (!state.oauthFlowId) return;
+  const button = $("#oauth-complete");
+  setButtonBusy(button, true, "检查中");
+  try {
+    const result = await api(`/api/oauth/device/${state.oauthFlowId}/complete`, {
+      method: "POST",
+    });
+    if (result.status === "pending") {
+      $("#oauth-device-status").textContent = result.message || "请先在 Microsoft 页面完成授权";
+      return;
+    }
+    closeOAuthModal();
+    toast(`${result.email} 已授权并加入邮箱列表`);
+    state.accountsPage = 1;
+    await loadAccounts();
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
 function updateImportLineCount() {
   const lines = $("#account-lines").value
     .split(/\r?\n/)
@@ -1445,6 +1517,13 @@ function bindEvents() {
   });
   $("#account-lines").addEventListener("input", updateImportLineCount);
   $("#import-form").addEventListener("submit", importAccounts);
+  $("#open-oauth-modal").addEventListener("click", openOAuthModal);
+  $$(".close-oauth-modal").forEach((button) => button.addEventListener("click", closeOAuthModal));
+  $("#oauth-overlay").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeOAuthModal();
+  });
+  $("#oauth-start-form").addEventListener("submit", startOAuthDeviceAuthorization);
+  $("#oauth-complete").addEventListener("click", completeOAuthDeviceAuthorization);
 
   $("#confirm-cancel").addEventListener("click", () => resolveConfirm(false));
   $("#confirm-submit").addEventListener("click", () => resolveConfirm(true));
@@ -1517,6 +1596,7 @@ function bindEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     closeImport();
+    closeOAuthModal();
     closeShareLink();
     closeTargetModal();
     closeTargetTagsModal();

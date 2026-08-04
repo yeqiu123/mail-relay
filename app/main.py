@@ -19,6 +19,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from .config import config
 from .imap_client import MailboxError, OutlookMailbox
 from .microsoft import (
+    DeviceAuthorizationError,
     MailArchiveCoordinator,
     MicrosoftTokenService,
     RefreshCoordinator,
@@ -130,6 +131,11 @@ class ShareLinkPayload(BaseModel):
 
 class ShareLinkExpiryPayload(BaseModel):
     expires_in_days: int = Field(ge=0, le=365)
+
+
+class OAuthDeviceStartPayload(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    client_id: str = Field(min_length=3, max_length=100)
 
 
 class MailTargetPayload(BaseModel):
@@ -578,6 +584,109 @@ async def login(payload: LoginPayload, request: Request) -> dict[str, str]:
 async def logout(request: Request) -> dict[str, bool]:
     request.session.clear()
     return {"ok": True}
+
+
+@app.post("/api/oauth/device")
+async def start_oauth_device_authorization(
+    payload: OAuthDeviceStartPayload,
+    user: CurrentUser,
+) -> dict[str, object]:
+    email_address = payload.email.strip().lower()
+    client_id = payload.client_id.strip()
+    if not EMAIL_PATTERN.match(email_address):
+        raise HTTPException(status_code=422, detail="邮箱格式无效")
+    if not client_id:
+        raise HTTPException(status_code=422, detail="Microsoft 客户端 ID 无效")
+    tenant = str(store.get_settings()["tenant"])
+    try:
+        authorization = await token_service.start_device_authorization(
+            tenant, client_id
+        )
+    except DeviceAuthorizationError as exc:
+        status_code = 422 if exc.code in {"invalid_client", "unauthorized_client"} else 502
+        raise HTTPException(status_code=status_code, detail=exc.description) from exc
+    return store.create_oauth_device_flow(
+        int(user["id"]),
+        email_address,
+        client_id,
+        tenant,
+        str(authorization["device_code"]),
+        str(authorization["user_code"]),
+        str(authorization["verification_uri"]),
+        authorization["verification_uri_complete"],
+        int(authorization["expires_in"]),
+        int(authorization["interval"]),
+    )
+
+
+@app.post("/api/oauth/device/{flow_id}/complete")
+async def complete_oauth_device_authorization(
+    flow_id: str,
+    user: CurrentUser,
+) -> dict[str, object]:
+    if not TOKEN_PATTERN.match(flow_id):
+        raise HTTPException(status_code=404, detail="授权请求不存在")
+    owner_id = int(user["id"])
+    flow = store.get_oauth_device_flow(owner_id, flow_id)
+    if not flow:
+        raise HTTPException(status_code=404, detail="授权请求不存在")
+    if flow["status"] == "completed":
+        return {
+            "status": "completed",
+            "account_id": flow["account_id"],
+            "email": flow["email"],
+        }
+    if flow["status"] != "pending":
+        raise HTTPException(status_code=410, detail="授权请求已结束，请重新发起授权")
+    if int(flow["expires_at"]) <= int(time.time()):
+        store.finish_oauth_device_flow(owner_id, flow_id, "expired", error="授权码已过期")
+        raise HTTPException(status_code=410, detail="授权码已过期，请重新发起授权")
+
+    try:
+        token_result = await token_service.complete_device_authorization(
+            str(flow["tenant"]),
+            str(flow["client_id"]),
+            str(flow["device_code"]),
+        )
+    except DeviceAuthorizationError as exc:
+        if exc.code in {"authorization_pending", "slow_down"}:
+            return {"status": "pending", "message": "请先在 Microsoft 页面完成授权"}
+        if exc.code in {"authorization_declined", "expired_token", "bad_verification_code"}:
+            store.finish_oauth_device_flow(owner_id, flow_id, "failed", error=exc.description)
+            raise HTTPException(status_code=422, detail=exc.description) from exc
+        raise HTTPException(status_code=502, detail=exc.description) from exc
+
+    imported = store.import_accounts(
+        owner_id,
+        [
+            {
+                "provider": "outlook",
+                "email": str(flow["email"]),
+                "client_id": str(flow["client_id"]),
+                "refresh_token": str(token_result["refresh_token"]),
+            }
+        ],
+    )
+    account_id = int(imported["account_ids"][0])
+    now = int(time.time())
+    settings = store.get_settings()
+    store.update_tokens(
+        account_id,
+        str(token_result["access_token"]),
+        now + int(token_result["expires_in"]),
+        str(token_result["refresh_token"]),
+        now,
+        now + int(settings["refresh_interval_days"]) * 86400,
+    )
+    store.add_refresh_log(
+        account_id,
+        owner_id,
+        str(flow["email"]),
+        "success",
+        "Microsoft 设备授权完成",
+    )
+    store.finish_oauth_device_flow(owner_id, flow_id, "completed", account_id)
+    return {"status": "completed", "account_id": account_id, "email": flow["email"]}
 
 
 @app.get("/api/dashboard")
