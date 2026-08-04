@@ -7,7 +7,7 @@
   <title>Mail Relay</title>
   <link rel="stylesheet" href="/static/styles.css?v=20260804-mmp">
   <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
-  <script defer src="/static/app.js"></script>
+  <script defer src="/static/app.js?v=20260804-status"></script>
 </head>
 <body>
   <div class="boot-screen" id="boot-screen" aria-label="正在加载">
@@ -163,9 +163,9 @@
             <small>可读取邮件</small>
           </div>
           <div class="metric">
-            <span class="metric-label">待刷新</span>
+            <span class="metric-label">待处理</span>
             <strong id="metric-pending">0</strong>
-            <small>等待后台处理</small>
+            <small>令牌待刷新或收件箱读取异常</small>
           </div>
           <div class="metric">
             <span class="metric-label">失效账号</span>
@@ -186,9 +186,9 @@
               </label>
               <select class="select-control" id="status-filter" aria-label="状态筛选">
                 <option value="">全部状态</option>
-                <option value="active">令牌正常</option>
+                <option value="active">可读取</option>
                 <option value="pending">待刷新</option>
-                <option value="error">刷新异常</option>
+                <option value="error">账户异常</option>
                 <option value="invalid">已失效</option>
               </select>
             </div>

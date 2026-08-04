@@ -55,7 +55,7 @@ const viewMeta = {
 const statusMeta = {
   active: { label: "可读取", className: "active" },
   pending: { label: "待刷新", className: "pending" },
-  error: { label: "刷新异常", className: "error" },
+  error: { label: "账户异常", className: "error" },
   invalid: { label: "已失效", className: "invalid" },
 };
 

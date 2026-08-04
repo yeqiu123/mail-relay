@@ -77,6 +77,7 @@ class Store:
                 last_mail_at          INTEGER,
                 last_archive_sync_at  INTEGER,
                 last_error            TEXT,
+                last_mail_error       TEXT,
                 created_at            INTEGER NOT NULL,
                 updated_at            INTEGER NOT NULL,
                 FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -418,6 +419,19 @@ class Store:
                     connection.execute(
                         "ALTER TABLE accounts ADD COLUMN last_archive_sync_at INTEGER"
                     )
+                if "last_mail_error" not in account_columns:
+                    connection.execute(
+                        "ALTER TABLE accounts ADD COLUMN last_mail_error TEXT"
+                    )
+
+            # 旧版本将 IMAP 错误写入通用错误字段，升级后保留为收件箱读取异常。
+            connection.execute(
+                """
+                UPDATE accounts
+                SET last_mail_error = last_error
+                WHERE last_mail_error IS NULL AND last_error LIKE 'IMAP %'
+                """
+            )
 
             connection.execute(
                 "UPDATE accounts SET owner_id = ? WHERE owner_id IS NULL",
@@ -635,18 +649,20 @@ class Store:
 
     @staticmethod
     def _public_account(row: sqlite3.Row) -> dict[str, Any]:
+        mail_error = row["last_mail_error"] if "last_mail_error" in row.keys() else None
         return {
             "id": row["id"],
             "provider": row["provider"] if "provider" in row.keys() else "outlook",
             "email": row["email"],
             "icloud_alias": row["icloud_alias"] if "icloud_alias" in row.keys() else None,
             "client_id": row["client_id"],
-            "status": row["status"],
+            "status": "error" if mail_error else row["status"],
             "last_refresh_at": row["last_refresh_at"],
             "next_refresh_at": row["next_refresh_at"],
             "last_mail_at": row["last_mail_at"],
             "last_archive_sync_at": row["last_archive_sync_at"] if "last_archive_sync_at" in row.keys() else None,
-            "last_error": row["last_error"],
+            "last_error": mail_error or row["last_error"],
+            "last_mail_error": mail_error,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -738,7 +754,11 @@ class Store:
         if search:
             where.append("email LIKE ?")
             params.append(f"%{search}%")
-        if status:
+        if status == "active":
+            where.append("status = 'active' AND last_mail_error IS NULL")
+        elif status == "error":
+            where.append("(status = 'error' OR last_mail_error IS NOT NULL)")
+        elif status:
             where.append("status = ?")
             params.append(status)
         where_sql = f"WHERE {' AND '.join(where)}"
@@ -772,8 +792,15 @@ class Store:
                 """
                 SELECT
                     COUNT(*) AS total,
-                    SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
-                    SUM(CASE WHEN status IN ('pending', 'error') THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE
+                        WHEN status = 'active' AND last_mail_error IS NULL THEN 1
+                        ELSE 0
+                    END) AS active,
+                    SUM(CASE
+                        WHEN status IN ('pending', 'error')
+                          OR (status = 'active' AND last_mail_error IS NOT NULL) THEN 1
+                        ELSE 0
+                    END) AS pending,
                     SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END) AS invalid
                 FROM accounts
                 WHERE owner_id = ?
@@ -964,7 +991,13 @@ class Store:
             connection.execute(
                 """
                 UPDATE accounts
-                SET last_archive_sync_at = ?, last_mail_at = ?, last_error = NULL, updated_at = ?
+                SET last_archive_sync_at = ?, last_mail_at = ?,
+                    last_error = CASE
+                        WHEN last_mail_error IS NOT NULL THEN NULL
+                        ELSE last_error
+                    END,
+                    last_mail_error = NULL,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (value, value, int(time.time()), account_id),
@@ -1804,8 +1837,12 @@ class Store:
     def set_mail_error(self, account_id: int, message: str) -> None:
         with self._write_lock, self._connect() as connection:
             connection.execute(
-                "UPDATE accounts SET last_error = ?, updated_at = ? WHERE id = ?",
-                (message[:600], int(time.time()), account_id),
+                """
+                UPDATE accounts
+                SET last_error = ?, last_mail_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (message[:600], message[:600], int(time.time()), account_id),
             )
 
     def get_settings(self) -> dict[str, Any]:
