@@ -1108,6 +1108,38 @@ textarea:focus {
   min-width: 720px;
 }
 
+.targets-table-wrap {
+  min-height: 460px;
+}
+
+.targets-table {
+  min-width: 820px;
+}
+
+.target-email-column {
+  width: 28%;
+}
+
+.target-account-column {
+  width: 25%;
+}
+
+.target-count-column {
+  width: 11%;
+}
+
+.target-status-column {
+  width: 13%;
+}
+
+.target-time-column {
+  width: 15%;
+}
+
+.target-actions-column {
+  width: 8%;
+}
+
 .user-name-column {
   width: 25%;
 }
@@ -1158,6 +1190,10 @@ textarea:focus {
   width: min(520px, 100%);
 }
 
+.target-modal {
+  width: min(560px, 100%);
+}
+
 .share-modal {
   width: min(620px, 100%);
 }
@@ -1179,7 +1215,16 @@ textarea:focus {
   gap: 18px;
 }
 
+.target-form-body {
+  display: grid;
+  gap: 18px;
+}
+
 .user-form-body .text-control {
+  height: 42px;
+}
+
+.target-form-body .text-control {
   height: 42px;
 }
 

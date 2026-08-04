@@ -14,6 +14,8 @@ const state = {
   accountRequest: 0,
   currentUser: { username: "", role: "" },
   users: [],
+  targets: [],
+  targetAccounts: [],
   userModalMode: "create",
   userEditingId: null,
   shareUrl: "",
@@ -24,6 +26,10 @@ const viewMeta = {
   accounts: {
     title: "邮箱管理",
     subtitle: "Outlook 账号与收件箱管理",
+  },
+  targets: {
+    title: "别名管理",
+    subtitle: "按隐藏邮箱地址筛选归档邮件",
   },
   logs: {
     title: "刷新记录",
@@ -259,6 +265,7 @@ function setView(view) {
   closeSidebar();
 
   if (view === "accounts") loadAccounts();
+  if (view === "targets") loadTargets();
   if (view === "logs") loadLogs();
   if (view === "settings") loadSettings();
   if (view === "users") loadUsers();
@@ -596,6 +603,153 @@ async function exportAccounts() {
     toast(error.message, "error");
   } finally {
     setButtonBusy(button, false);
+  }
+}
+
+async function loadTargets() {
+  const tbody = $("#targets-tbody");
+  renderTableLoading(tbody, 6);
+  try {
+    const result = await api("/api/targets");
+    state.targets = Array.isArray(result.items) ? result.items : [];
+    renderTargets(state.targets);
+  } catch (error) {
+    if (!error.authExpired) renderTableError(tbody, 6, error.message);
+  }
+}
+
+function renderTargets(targets) {
+  const tbody = $("#targets-tbody");
+  if (!targets.length) {
+    tbody.innerHTML = `
+      <tr>
+        <td class="empty-cell" colspan="6">
+          <div class="empty-state">
+            <i data-lucide="at-sign"></i>
+            <strong>尚未添加别名</strong>
+            <span>为 Outlook 邮箱添加隐藏邮箱地址后，可生成独立共享链接</span>
+          </div>
+        </td>
+      </tr>
+    `;
+  } else {
+    tbody.innerHTML = targets.map((target) => {
+      const enabled = Boolean(target.enabled);
+      return `
+        <tr data-target-id="${target.id}">
+          <td class="email-cell">
+            <button class="email-copy" type="button" data-target-action="copy-email" data-id="${target.id}" aria-label="复制 ${escapeHtml(target.email)}" title="点击复制邮箱地址">
+              <strong>${escapeHtml(target.email)}</strong>
+              <i data-lucide="copy"></i>
+            </button>
+          </td>
+          <td class="email-cell"><strong title="${escapeHtml(target.account_email)}">${escapeHtml(target.account_email)}</strong></td>
+          <td><span class="user-count">${Number(target.message_count || 0)}</span></td>
+          <td><span class="status ${enabled ? "active" : "user-disabled"}">${enabled ? "启用" : "已停用"}</span></td>
+          <td class="time-cell">${formatTime(target.created_at)}</td>
+          <td>
+            <div class="row-actions">
+              <button class="row-action" type="button" data-target-action="share" data-id="${target.id}" aria-label="生成共享链接" title="生成共享链接">
+                <i data-lucide="link"></i>
+              </button>
+              <button class="row-action" type="button" data-target-action="toggle" data-id="${target.id}" aria-label="${enabled ? "停用别名" : "启用别名"}" title="${enabled ? "停用别名" : "启用别名"}">
+                <i data-lucide="power"></i>
+              </button>
+              <button class="row-action delete" type="button" data-target-action="delete" data-id="${target.id}" aria-label="删除别名" title="删除别名">
+                <i data-lucide="trash-2"></i>
+              </button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join("");
+  }
+  $("#targets-total").textContent = `共 ${targets.length} 个别名`;
+  refreshIcons(tbody);
+}
+
+async function openTargetModal() {
+  try {
+    const result = await api("/api/accounts/options");
+    state.targetAccounts = Array.isArray(result.items) ? result.items : [];
+    if (!state.targetAccounts.length) {
+      toast("请先导入 Outlook 邮箱", "error");
+      return;
+    }
+    $("#target-account-select").innerHTML = state.targetAccounts.map((account) => `
+      <option value="${account.id}">${escapeHtml(account.email)}</option>
+    `).join("");
+    $("#target-email-input").value = "";
+    showOverlay($("#target-overlay"), true);
+    window.setTimeout(() => $("#target-email-input").focus(), 80);
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  }
+}
+
+function closeTargetModal() {
+  showOverlay($("#target-overlay"), false);
+}
+
+async function submitTargetForm(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  setButtonBusy(button, true, "添加中");
+  try {
+    await api("/api/targets", {
+      method: "POST",
+      body: JSON.stringify({
+        account_id: Number($("#target-account-select").value),
+        email: $("#target-email-input").value.trim(),
+      }),
+    });
+    closeTargetModal();
+    toast("别名已添加");
+    await loadTargets();
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function generateTargetShareLink(target) {
+  try {
+    const result = await api(`/api/targets/${target.id}/share`, { method: "POST" });
+    const url = result.url || new URL(result.path, window.location.origin).href;
+    openShareLink(result.email, url);
+    toast("别名共享链接已生成");
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  }
+}
+
+async function toggleTarget(target) {
+  try {
+    await api(`/api/targets/${target.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: !target.enabled }),
+    });
+    toast(target.enabled ? "别名已停用" : "别名已启用");
+    await loadTargets();
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  }
+}
+
+async function deleteTarget(target) {
+  const accepted = await askConfirm({
+    title: "删除别名",
+    message: `将删除别名 ${target.email} 及其共享链接。`,
+    submitLabel: "确认删除",
+  });
+  if (!accepted) return;
+  try {
+    await api(`/api/targets/${target.id}`, { method: "DELETE" });
+    toast("别名及其共享链接已删除");
+    await loadTargets();
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
   }
 }
 
@@ -1169,6 +1323,22 @@ function bindEvents() {
     if (event.target === event.currentTarget) closeShareLink();
   });
   $("#copy-share-link").addEventListener("click", copyShareLink);
+  $("#open-target-modal").addEventListener("click", openTargetModal);
+  $$(".close-target-modal").forEach((button) => button.addEventListener("click", closeTargetModal));
+  $("#target-overlay").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeTargetModal();
+  });
+  $("#target-form").addEventListener("submit", submitTargetForm);
+  $("#targets-tbody").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-target-action]");
+    if (!button) return;
+    const target = state.targets.find((item) => item.id === Number(button.dataset.id));
+    if (!target) return;
+    if (button.dataset.targetAction === "copy-email") copyEmailAddress(target.email);
+    if (button.dataset.targetAction === "share") generateTargetShareLink(target);
+    if (button.dataset.targetAction === "toggle") toggleTarget(target);
+    if (button.dataset.targetAction === "delete") deleteTarget(target);
+  });
   $("#open-user-modal").addEventListener("click", () => openUserModal());
   $$(".close-user-modal").forEach((button) => button.addEventListener("click", closeUserModal));
   $("#user-overlay").addEventListener("click", (event) => {
@@ -1203,6 +1373,7 @@ function bindEvents() {
     if (event.key !== "Escape") return;
     closeImport();
     closeShareLink();
+    closeTargetModal();
     closeDrawer();
     closeSidebar();
     if (state.confirmResolve) resolveConfirm(false);

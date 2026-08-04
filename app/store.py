@@ -149,6 +149,59 @@ class Store:
             """
         )
 
+    @staticmethod
+    def _create_mail_recipients_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mail_recipients (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                mail_message_id INTEGER NOT NULL,
+                email           TEXT NOT NULL COLLATE NOCASE,
+                recipient_type  TEXT NOT NULL,
+                FOREIGN KEY(mail_message_id) REFERENCES mail_messages(id) ON DELETE CASCADE,
+                UNIQUE(mail_message_id, email, recipient_type)
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_mail_targets_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mail_targets (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id    INTEGER NOT NULL,
+                account_id  INTEGER NOT NULL,
+                email       TEXT NOT NULL COLLATE NOCASE,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                UNIQUE(owner_id, account_id, email)
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_target_share_links_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS target_share_links (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id        INTEGER NOT NULL,
+                target_id       INTEGER NOT NULL,
+                token           TEXT NOT NULL UNIQUE,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                last_access_at  INTEGER,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(target_id) REFERENCES mail_targets(id) ON DELETE CASCADE,
+                UNIQUE(owner_id, target_id)
+            )
+            """
+        )
+
     def _ensure_admin(
         self,
         connection: sqlite3.Connection,
@@ -318,6 +371,9 @@ class Store:
             )
             self._create_share_links_table(connection)
             self._create_mail_messages_table(connection)
+            self._create_mail_recipients_table(connection)
+            self._create_mail_targets_table(connection)
+            self._create_target_share_links_table(connection)
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_accounts_owner
@@ -336,6 +392,12 @@ class Store:
                     ON mail_messages(account_id, received_at DESC, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_mail_messages_owner_account
                     ON mail_messages(owner_id, account_id);
+                CREATE INDEX IF NOT EXISTS idx_mail_recipients_email
+                    ON mail_recipients(email, mail_message_id);
+                CREATE INDEX IF NOT EXISTS idx_mail_targets_owner_account
+                    ON mail_targets(owner_id, account_id);
+                CREATE INDEX IF NOT EXISTS idx_target_share_links_token
+                    ON target_share_links(token);
                 """
             )
             connection.executemany(
@@ -712,6 +774,31 @@ class Store:
                         now,
                     ),
                 )
+                message_row = connection.execute(
+                    "SELECT id FROM mail_messages WHERE account_id = ? AND uid = ?",
+                    (account_id, uid),
+                ).fetchone()
+                if message_row:
+                    message_id = int(message_row["id"])
+                    connection.execute(
+                        "DELETE FROM mail_recipients WHERE mail_message_id = ?",
+                        (message_id,),
+                    )
+                    for recipient in message.get("recipients") or []:
+                        if not isinstance(recipient, dict):
+                            continue
+                        email_address = str(recipient.get("email") or "").strip().lower()
+                        recipient_type = str(recipient.get("recipient_type") or "").strip()
+                        if not email_address or recipient_type not in {"to", "cc"}:
+                            continue
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO mail_recipients(
+                                mail_message_id, email, recipient_type
+                            ) VALUES (?, ?, ?)
+                            """,
+                            (message_id, email_address, recipient_type),
+                        )
                 count += 1
         return count
 
@@ -794,6 +881,226 @@ class Store:
                 (value, value, int(time.time()), account_id),
             )
 
+    def list_mail_targets(self, owner_id: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    mail_targets.*,
+                    accounts.email AS account_email,
+                    COUNT(DISTINCT mail_messages.id) AS message_count
+                FROM mail_targets
+                JOIN accounts ON accounts.id = mail_targets.account_id
+                LEFT JOIN mail_recipients
+                    ON mail_recipients.email = mail_targets.email
+                LEFT JOIN mail_messages
+                    ON mail_messages.id = mail_recipients.mail_message_id
+                    AND mail_messages.account_id = mail_targets.account_id
+                WHERE mail_targets.owner_id = ?
+                GROUP BY mail_targets.id
+                ORDER BY mail_targets.created_at DESC, mail_targets.id DESC
+                """,
+                (owner_id,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "account_id": int(row["account_id"]),
+                "account_email": row["account_email"],
+                "email": row["email"],
+                "enabled": bool(row["enabled"]),
+                "message_count": int(row["message_count"] or 0),
+                "created_at": int(row["created_at"]),
+                "updated_at": int(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def create_mail_target(
+        self,
+        owner_id: int,
+        account_id: int,
+        email_address: str,
+    ) -> dict[str, Any]:
+        normalized_email = email_address.strip().lower()
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            account = connection.execute(
+                "SELECT email FROM accounts WHERE id = ? AND owner_id = ?",
+                (account_id, owner_id),
+            ).fetchone()
+            if not account:
+                raise ValueError("邮箱不存在")
+            existing = connection.execute(
+                """
+                SELECT * FROM mail_targets
+                WHERE owner_id = ? AND account_id = ? AND email = ? COLLATE NOCASE
+                """,
+                (owner_id, account_id, normalized_email),
+            ).fetchone()
+            if existing:
+                return {
+                    "id": int(existing["id"]),
+                    "account_id": account_id,
+                    "account_email": account["email"],
+                    "email": existing["email"],
+                    "enabled": bool(existing["enabled"]),
+                    "created_at": int(existing["created_at"]),
+                    "updated_at": int(existing["updated_at"]),
+                }
+            cursor = connection.execute(
+                """
+                INSERT INTO mail_targets(
+                    owner_id, account_id, email, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (owner_id, account_id, normalized_email, now, now),
+            )
+        return {
+            "id": int(cursor.lastrowid),
+            "account_id": account_id,
+            "account_email": account["email"],
+            "email": normalized_email,
+            "enabled": True,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def set_mail_target_enabled(
+        self,
+        owner_id: int,
+        target_id: int,
+        enabled: bool,
+    ) -> bool:
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mail_targets
+                SET enabled = ?, updated_at = ?
+                WHERE id = ? AND owner_id = ?
+                """,
+                (1 if enabled else 0, int(time.time()), target_id, owner_id),
+            )
+        return cursor.rowcount > 0
+
+    def delete_mail_target(self, owner_id: int, target_id: int) -> bool:
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM mail_targets WHERE id = ? AND owner_id = ?",
+                (target_id, owner_id),
+            )
+        return cursor.rowcount > 0
+
+    def get_or_create_target_share_link(
+        self,
+        owner_id: int,
+        target_id: int,
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            target = connection.execute(
+                """
+                SELECT mail_targets.*, accounts.email AS account_email
+                FROM mail_targets
+                JOIN accounts ON accounts.id = mail_targets.account_id
+                WHERE mail_targets.id = ? AND mail_targets.owner_id = ?
+                """,
+                (target_id, owner_id),
+            ).fetchone()
+            if not target:
+                raise ValueError("别名不存在")
+            existing = connection.execute(
+                """
+                SELECT * FROM target_share_links
+                WHERE owner_id = ? AND target_id = ?
+                """,
+                (owner_id, target_id),
+            ).fetchone()
+            if existing:
+                return {
+                    "id": int(existing["id"]),
+                    "target_id": target_id,
+                    "email": target["email"],
+                    "account_email": target["account_email"],
+                    "token": existing["token"],
+                    "created_at": int(existing["created_at"]),
+                    "updated_at": int(existing["updated_at"]),
+                    "last_access_at": existing["last_access_at"],
+                }
+            token = str(uuid.uuid4())
+            cursor = connection.execute(
+                """
+                INSERT INTO target_share_links(
+                    owner_id, target_id, token, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (owner_id, target_id, token, now, now),
+            )
+        return {
+            "id": int(cursor.lastrowid),
+            "target_id": target_id,
+            "email": target["email"],
+            "account_email": target["account_email"],
+            "token": token,
+            "created_at": now,
+            "updated_at": now,
+            "last_access_at": None,
+        }
+
+    def list_target_archived_messages(
+        self,
+        owner_id: int,
+        target_id: int,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        offset = (page - 1) * page_size
+        with self._connect() as connection:
+            target = connection.execute(
+                """
+                SELECT * FROM mail_targets
+                WHERE id = ? AND owner_id = ?
+                """,
+                (target_id, owner_id),
+            ).fetchone()
+            if not target:
+                return {"items": [], "total": 0, "page": page, "page_size": page_size}
+            params = (owner_id, int(target["account_id"]), target["email"])
+            total = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(DISTINCT mail_messages.id)
+                    FROM mail_messages
+                    JOIN mail_recipients
+                        ON mail_recipients.mail_message_id = mail_messages.id
+                    WHERE mail_messages.owner_id = ?
+                      AND mail_messages.account_id = ?
+                      AND mail_recipients.email = ? COLLATE NOCASE
+                    """,
+                    params,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT DISTINCT mail_messages.*
+                FROM mail_messages
+                JOIN mail_recipients
+                    ON mail_recipients.mail_message_id = mail_messages.id
+                WHERE mail_messages.owner_id = ?
+                  AND mail_messages.account_id = ?
+                  AND mail_recipients.email = ? COLLATE NOCASE
+                ORDER BY mail_messages.received_at DESC, mail_messages.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_size, offset),
+            ).fetchall()
+        return {
+            "items": [self._public_message(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
     def get_or_create_share_link(
         self,
         owner_id: int,
@@ -841,30 +1148,60 @@ class Store:
                 "last_access_at": None,
             }
 
-    def get_shared_account(self, token: str) -> dict[str, Any] | None:
+    def get_shared_mailbox(self, token: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT accounts.*, share_links.token, share_links.id AS share_id
-                FROM share_links
-                JOIN accounts ON accounts.id = share_links.account_id
-                WHERE share_links.token = ?
+                SELECT
+                    accounts.*,
+                    target_share_links.token,
+                    target_share_links.id AS share_id,
+                    mail_targets.id AS target_id,
+                    mail_targets.email AS target_email
+                FROM target_share_links
+                JOIN mail_targets ON mail_targets.id = target_share_links.target_id
+                JOIN accounts ON accounts.id = mail_targets.account_id
+                WHERE target_share_links.token = ?
+                  AND mail_targets.enabled = 1
                 """,
                 (token,),
             ).fetchone()
+            if not row:
+                row = connection.execute(
+                    """
+                    SELECT
+                        accounts.*,
+                        share_links.token,
+                        share_links.id AS share_id,
+                        NULL AS target_id,
+                        NULL AS target_email
+                    FROM share_links
+                    JOIN accounts ON accounts.id = share_links.account_id
+                    WHERE share_links.token = ?
+                    """,
+                    (token,),
+                ).fetchone()
         if not row:
             return None
         account = dict(row)
+        account["shared_email"] = account["target_email"] or account["email"]
         account["password"] = self.vault.decrypt(row["password_cipher"])
         account["refresh_token"] = self.vault.decrypt(row["refresh_token_cipher"])
         account["access_token"] = self.vault.decrypt(row["access_token_cipher"])
         return account
+
+    def get_shared_account(self, token: str) -> dict[str, Any] | None:
+        return self.get_shared_mailbox(token)
 
     def mark_share_access(self, token: str) -> None:
         now = int(time.time())
         with self._write_lock, self._connect() as connection:
             connection.execute(
                 "UPDATE share_links SET last_access_at = ?, updated_at = ? WHERE token = ?",
+                (now, now, token),
+            )
+            connection.execute(
+                "UPDATE target_share_links SET last_access_at = ?, updated_at = ? WHERE token = ?",
                 (now, now, token),
             )
 

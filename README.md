@@ -8,6 +8,7 @@ Mail Relay is a self-hosted Outlook mailbox management service with encrypted cr
 - Refresh Microsoft OAuth refresh tokens on a configurable schedule and store the latest token.
 - Read mailbox messages through IMAP with XOAUTH2 authentication.
 - Isolate mailbox data, messages, exports, and refresh logs between users.
+- Define hidden-mail aliases under each Outlook account, filter archived messages by the recipient address, and create a protected public link for each alias.
 - Create public mailbox links on a separate domain. Visitors complete a CAPTCHA before viewing the newest message.
 - Copy, export, refresh, and manage accounts from the web interface.
 

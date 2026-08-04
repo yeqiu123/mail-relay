@@ -7,7 +7,7 @@ import ssl
 from email.header import decode_header
 from email.message import Message
 from email.policy import default
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any
@@ -136,6 +136,22 @@ def _body_text(message: Message) -> str:
     return extractor.text()[:200000]
 
 
+def _recipients(message: Message) -> list[dict[str, str]]:
+    recipients: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for recipient_type, header in (("to", "To"), ("cc", "Cc")):
+        for _, address in getaddresses([str(message.get(header) or "")]):
+            email_address = address.strip().lower()
+            key = (email_address, recipient_type)
+            if not email_address or key in seen:
+                continue
+            seen.add(key)
+            recipients.append(
+                {"email": email_address, "recipient_type": recipient_type}
+            )
+    return recipients
+
+
 class OutlookMailbox:
     def __init__(self, host: str, port: int) -> None:
         self.host = host
@@ -194,6 +210,7 @@ class OutlookMailbox:
                         "received_at": _parse_date(parsed.get("Date")),
                         "message_id": str(parsed.get("Message-ID") or ""),
                         "body": _body_text(parsed),
+                        "recipients": _recipients(parsed),
                     }
                 )
             return messages
@@ -244,6 +261,7 @@ class OutlookMailbox:
                         "received_at": _parse_date(parsed.get("Date")),
                         "message_id": str(parsed.get("Message-ID") or ""),
                         "body": _body_text(parsed),
+                        "recipients": _recipients(parsed),
                     }
                 )
             return {
@@ -292,6 +310,7 @@ class OutlookMailbox:
                 "received_at": _parse_date(parsed.get("Date")),
                 "message_id": str(parsed.get("Message-ID") or ""),
                 "body": _body_text(parsed),
+                "recipients": _recipients(parsed),
             }
         except imaplib.IMAP4.error as exc:
             raise MailboxError(f"读取邮件正文失败：{exc}") from exc

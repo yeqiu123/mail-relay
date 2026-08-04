@@ -106,6 +106,15 @@ class ShareLinkPayload(BaseModel):
     account_id: int = Field(ge=1)
 
 
+class MailTargetPayload(BaseModel):
+    account_id: int = Field(ge=1)
+    email: str = Field(min_length=3, max_length=320)
+
+
+class MailTargetStatusPayload(BaseModel):
+    enabled: bool
+
+
 class SettingsPayload(BaseModel):
     tenant: str = Field(min_length=1, max_length=100)
     refresh_interval_days: int = Field(ge=1, le=30)
@@ -398,14 +407,14 @@ async def health() -> dict[str, str]:
 
 @app.get("/m/{token}/view")
 async def legacy_public_mail_view(token: str) -> Response:
-    if not TOKEN_PATTERN.match(token) or not store.get_shared_account(token):
+    if not TOKEN_PATTERN.match(token) or not store.get_shared_mailbox(token):
         return public_not_found()
     return RedirectResponse(f"{config.public_share_origin}/{token}", status_code=302)
 
 
 @app.get("/{token}/captcha.svg")
 async def public_captcha(token: str, request: Request) -> Response:
-    if not TOKEN_PATTERN.match(token) or not is_public_host(request) or not store.get_shared_account(token):
+    if not TOKEN_PATTERN.match(token) or not is_public_host(request) or not store.get_shared_mailbox(token):
         return Response("not found", status_code=404)
     alphabet = string.ascii_uppercase + string.digits
     answer = "".join(secrets.choice(alphabet) for _ in range(4))
@@ -422,7 +431,7 @@ async def public_captcha(token: str, request: Request) -> Response:
 
 @app.post("/{token}/verify")
 async def verify_public_mail(token: str, request: Request) -> Response:
-    if not TOKEN_PATTERN.match(token) or not is_public_host(request) or not store.get_shared_account(token):
+    if not TOKEN_PATTERN.match(token) or not is_public_host(request) or not store.get_shared_mailbox(token):
         return public_not_found()
 
     body = (await request.body()).decode("utf-8", errors="ignore")
@@ -450,7 +459,7 @@ async def public_mail_view(
     if not TOKEN_PATTERN.match(token) or not is_public_host(request):
         return public_not_found()
 
-    account = store.get_shared_account(token)
+    account = store.get_shared_mailbox(token)
     if not account:
         return public_not_found()
 
@@ -476,15 +485,23 @@ async def public_mail_view(
                 headers={"Cache-Control": "no-store"},
             )
 
-    result = store.list_archived_messages(
-        int(account["owner_id"]),
-        int(account["id"]),
-        1,
-        PUBLIC_MAIL_PAGE_SIZE,
-    )
+    if account["target_id"]:
+        result = store.list_target_archived_messages(
+            int(account["owner_id"]),
+            int(account["target_id"]),
+            1,
+            PUBLIC_MAIL_PAGE_SIZE,
+        )
+    else:
+        result = store.list_archived_messages(
+            int(account["owner_id"]),
+            int(account["id"]),
+            1,
+            PUBLIC_MAIL_PAGE_SIZE,
+        )
     store.mark_share_access(token)
     return HTMLResponse(
-        render_public_mail_page(token, account["email"], result),
+        render_public_mail_page(token, account["shared_email"], result),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -618,6 +635,78 @@ async def create_share_link(
 ) -> dict[str, str]:
     try:
         link = store.get_or_create_share_link(int(user["id"]), payload.account_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "email": str(link["email"]),
+        "token": str(link["token"]),
+        "path": f"/{link['token']}",
+        "url": f"{config.public_share_origin}/{link['token']}",
+    }
+
+
+@app.get("/api/accounts/options")
+async def list_account_options(user: CurrentUser) -> dict[str, object]:
+    result = store.list_accounts(
+        owner_id=int(user["id"]),
+        search="",
+        status="",
+        page=1,
+        page_size=5000,
+    )
+    return {"items": result["items"]}
+
+
+@app.get("/api/targets")
+async def list_mail_targets(user: CurrentUser) -> dict[str, object]:
+    return {"items": store.list_mail_targets(int(user["id"]))}
+
+
+@app.post("/api/targets")
+async def create_mail_target(
+    payload: MailTargetPayload,
+    user: CurrentUser,
+) -> dict[str, object]:
+    email_address = payload.email.strip().lower()
+    if not EMAIL_PATTERN.match(email_address):
+        raise HTTPException(status_code=422, detail="别名邮箱格式无效")
+    try:
+        return store.create_mail_target(
+            int(user["id"]), payload.account_id, email_address
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/targets/{target_id}")
+async def update_mail_target(
+    target_id: int,
+    payload: MailTargetStatusPayload,
+    user: CurrentUser,
+) -> dict[str, bool]:
+    updated = store.set_mail_target_enabled(
+        int(user["id"]), target_id, payload.enabled
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="别名不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/targets/{target_id}")
+async def delete_mail_target(target_id: int, user: CurrentUser) -> dict[str, bool]:
+    deleted = store.delete_mail_target(int(user["id"]), target_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="别名不存在")
+    return {"ok": True}
+
+
+@app.post("/api/targets/{target_id}/share")
+async def create_target_share_link(
+    target_id: int,
+    user: CurrentUser,
+) -> dict[str, str]:
+    try:
+        link = store.get_or_create_target_share_link(int(user["id"]), target_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
