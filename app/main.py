@@ -20,6 +20,7 @@ from .config import config
 from .imap_client import MailboxError, OutlookMailbox
 from .microsoft import (
     DeviceAuthorizationError,
+    FullRefreshCoordinator,
     MailArchiveCoordinator,
     MicrosoftTokenService,
     RefreshCoordinator,
@@ -42,12 +43,6 @@ PUBLIC_SHARE_HOST = (urlsplit(config.public_share_origin).hostname or "").lower(
 vault = Vault(config.encryption_key)
 store = Store(config.database_path, vault)
 token_service = MicrosoftTokenService(store, config)
-refresh_coordinator = RefreshCoordinator(
-    store,
-    token_service,
-    config.refresh_workers,
-    config.scheduler_seconds,
-)
 mailbox = OutlookMailbox(config.imap_host, config.imap_port)
 mail_archive_coordinator = MailArchiveCoordinator(
     store,
@@ -57,15 +52,29 @@ mail_archive_coordinator = MailArchiveCoordinator(
     config.scheduler_seconds,
     config.mail_sync_interval_seconds,
 )
+refresh_coordinator = RefreshCoordinator(
+    store,
+    token_service,
+    config.refresh_workers,
+    config.scheduler_seconds,
+)
+full_refresh_coordinator = FullRefreshCoordinator(
+    store,
+    token_service,
+    mail_archive_coordinator,
+    config.refresh_workers,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.initialize(config.admin_username, config.admin_password)
     await refresh_coordinator.start()
+    await full_refresh_coordinator.start()
     try:
         yield
     finally:
+        await full_refresh_coordinator.stop()
         await refresh_coordinator.stop()
         await token_service.close()
 
@@ -739,7 +748,8 @@ async def refresh_accounts(
     user: CurrentUser,
 ) -> dict[str, int]:
     account_ids = store.refreshable_ids(int(user["id"]), payload.ids or None)
-    queued = await refresh_coordinator.enqueue(account_ids)
+    store.mark_full_refresh_pending(account_ids)
+    queued = await full_refresh_coordinator.enqueue(account_ids)
     return {"matched": len(account_ids), "queued": queued}
 
 

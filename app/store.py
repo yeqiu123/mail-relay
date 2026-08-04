@@ -72,6 +72,7 @@ class Store:
                 access_token_cipher   TEXT,
                 access_expires_at     INTEGER,
                 status                TEXT NOT NULL DEFAULT 'pending',
+                full_refresh_pending  INTEGER NOT NULL DEFAULT 0,
                 last_refresh_at       INTEGER,
                 next_refresh_at       INTEGER,
                 last_mail_at          INTEGER,
@@ -423,6 +424,10 @@ class Store:
                     connection.execute(
                         "ALTER TABLE accounts ADD COLUMN last_mail_error TEXT"
                     )
+                if "full_refresh_pending" not in account_columns:
+                    connection.execute(
+                        "ALTER TABLE accounts ADD COLUMN full_refresh_pending INTEGER NOT NULL DEFAULT 0"
+                    )
 
             # 旧版本将 IMAP 错误写入通用错误字段，升级后保留为收件箱读取异常。
             connection.execute(
@@ -663,13 +668,22 @@ class Store:
     @staticmethod
     def _public_account(row: sqlite3.Row) -> dict[str, Any]:
         mail_error = row["last_mail_error"] if "last_mail_error" in row.keys() else None
+        full_refresh_pending = bool(
+            row["full_refresh_pending"]
+            if "full_refresh_pending" in row.keys()
+            else False
+        )
         return {
             "id": row["id"],
             "provider": row["provider"] if "provider" in row.keys() else "outlook",
             "email": row["email"],
             "icloud_alias": row["icloud_alias"] if "icloud_alias" in row.keys() else None,
             "client_id": row["client_id"],
-            "status": "error" if mail_error else row["status"],
+            "status": (
+                "pending"
+                if full_refresh_pending
+                else ("error" if mail_error else row["status"])
+            ),
             "last_refresh_at": row["last_refresh_at"],
             "next_refresh_at": row["next_refresh_at"],
             "last_mail_at": row["last_mail_at"],
@@ -712,7 +726,8 @@ class Store:
                             password_cipher = CASE WHEN ? THEN ? ELSE password_cipher END,
                             client_id = ?, refresh_token_cipher = ?,
                             access_token_cipher = NULL, access_expires_at = NULL,
-                            status = 'pending', last_refresh_at = NULL,
+                            status = 'pending', full_refresh_pending = 0,
+                            last_refresh_at = NULL,
                             next_refresh_at = ?, last_error = NULL, updated_at = ?
                         WHERE id = ? AND owner_id = ?
                         """,
@@ -768,9 +783,15 @@ class Store:
             where.append("email LIKE ?")
             params.append(f"%{search}%")
         if status == "active":
-            where.append("status = 'active' AND last_mail_error IS NULL")
+            where.append(
+                "status = 'active' AND last_mail_error IS NULL AND full_refresh_pending = 0"
+            )
         elif status == "error":
-            where.append("(status = 'error' OR last_mail_error IS NOT NULL)")
+            where.append(
+                "(status = 'error' OR last_mail_error IS NOT NULL) AND full_refresh_pending = 0"
+            )
+        elif status == "pending":
+            where.append("(status = 'pending' OR full_refresh_pending = 1)")
         elif status:
             where.append("status = ?")
             params.append(status)
@@ -806,11 +827,14 @@ class Store:
                 SELECT
                     COUNT(*) AS total,
                     SUM(CASE
-                        WHEN status = 'active' AND last_mail_error IS NULL THEN 1
+                        WHEN status = 'active'
+                          AND last_mail_error IS NULL
+                          AND full_refresh_pending = 0 THEN 1
                         ELSE 0
                     END) AS active,
                     SUM(CASE
                         WHEN status IN ('pending', 'error')
+                          OR full_refresh_pending = 1
                           OR (status = 'active' AND last_mail_error IS NOT NULL) THEN 1
                         ELSE 0
                     END) AS pending,
@@ -1655,6 +1679,59 @@ class Store:
                     (owner_id,),
                 ).fetchall()
         return [int(row["id"]) for row in rows]
+
+    def mark_full_refresh_pending(self, account_ids: Iterable[int]) -> None:
+        ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
+        if not ids:
+            return
+        now = int(time.time())
+        placeholders = ",".join("?" for _ in ids)
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE accounts
+                SET full_refresh_pending = 1, last_error = NULL,
+                    last_mail_error = NULL, updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now, *ids],
+            )
+
+    def mark_full_refresh_succeeded(self, account_id: int) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE accounts
+                SET status = 'active', full_refresh_pending = 0,
+                    last_error = NULL,
+                    last_mail_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(time.time()), account_id),
+            )
+
+    def mark_full_refresh_failure(
+        self,
+        account_id: int,
+        message: str,
+        mail_error: bool = False,
+    ) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE accounts
+                SET status = 'error', full_refresh_pending = 0,
+                    last_error = ?,
+                    last_mail_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    message[:600],
+                    message[:600] if mail_error else None,
+                    int(time.time()),
+                    account_id,
+                ),
+            )
 
     def update_tokens(
         self,

@@ -387,7 +387,7 @@ function renderAccounts(result) {
       const checked = state.selected.has(account.id) ? " checked" : "";
       const provider = account.client_id;
       const refreshAction = `
-              <button class="row-action" type="button" data-action="refresh" data-id="${account.id}" aria-label="刷新令牌" title="刷新令牌">
+              <button class="row-action" type="button" data-action="refresh" data-id="${account.id}" aria-label="完整校验邮箱" title="完整校验邮箱">
                 <i data-lucide="rotate-cw"></i>
               </button>`;
       return `
@@ -518,7 +518,7 @@ async function queueRefresh(ids) {
       method: "POST",
       body: JSON.stringify({ ids }),
     });
-    toast(`已加入刷新队列：${result.queued} 个`);
+    toast(`已加入邮箱校验队列：${result.queued} 个`);
     window.setTimeout(() => {
       if (state.view === "accounts") loadAccounts();
     }, 1600);

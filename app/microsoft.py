@@ -489,3 +489,81 @@ class MailArchiveCoordinator:
             "queued": self.queue.qsize(),
             "workers": self.worker_count,
         }
+
+
+class FullRefreshCoordinator:
+    """手动完整校验队列：刷新令牌后必须成功读取收件箱。"""
+
+    def __init__(
+        self,
+        store: Store,
+        token_service: MicrosoftTokenService,
+        mail_archive_coordinator: MailArchiveCoordinator,
+        worker_count: int,
+    ) -> None:
+        self.store = store
+        self.token_service = token_service
+        self.mail_archive_coordinator = mail_archive_coordinator
+        self.worker_count = worker_count
+        self.queue: asyncio.Queue[int] = asyncio.Queue()
+        self._queued_ids: set[int] = set()
+        self._queued_lock = asyncio.Lock()
+        self._tasks: list[asyncio.Task[Any]] = []
+
+    async def start(self) -> None:
+        self._tasks = [
+            asyncio.create_task(
+                self._worker(index), name=f"full-refresh-worker-{index}"
+            )
+            for index in range(self.worker_count)
+        ]
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    async def enqueue(self, account_ids: list[int]) -> int:
+        queued = 0
+        async with self._queued_lock:
+            for account_id in account_ids:
+                if account_id in self._queued_ids:
+                    continue
+                self._queued_ids.add(account_id)
+                self.queue.put_nowait(account_id)
+                queued += 1
+        return queued
+
+    async def _worker(self, index: int) -> None:
+        del index
+        while True:
+            account_id = await self.queue.get()
+            try:
+                await self.token_service.refresh_account(account_id)
+                await self.mail_archive_coordinator.sync_account(account_id)
+                self.store.mark_full_refresh_succeeded(account_id)
+            except TokenRefreshError as exc:
+                self.store.mark_full_refresh_failure(account_id, exc.description)
+            except MailboxError as exc:
+                self.store.mark_full_refresh_failure(
+                    account_id,
+                    str(exc),
+                    mail_error=True,
+                )
+            except Exception as exc:
+                self.store.mark_full_refresh_failure(
+                    account_id,
+                    f"internal_error: {exc.__class__.__name__}",
+                )
+            finally:
+                async with self._queued_lock:
+                    self._queued_ids.discard(account_id)
+                self.queue.task_done()
+
+    def status(self) -> dict[str, int]:
+        return {
+            "queued": self.queue.qsize(),
+            "workers": self.worker_count,
+        }
