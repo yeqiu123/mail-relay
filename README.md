@@ -9,6 +9,7 @@ Mail Relay is a self-hosted Outlook mailbox management service with encrypted cr
 - Read mailbox messages through IMAP with XOAUTH2 authentication.
 - Isolate mailbox data, messages, exports, and refresh logs between users.
 - Define hidden-mail aliases under each Outlook account, filter archived messages by the recipient address, and create a protected public link for each alias.
+- Group aliases with tags and search them by alias, mailbox, or tag from the management view.
 - Create public mailbox links on a separate domain. Visitors complete a CAPTCHA before viewing the newest message.
 - Copy, export, refresh, and manage accounts from the web interface.
 
@@ -19,6 +20,8 @@ Passwords, refresh tokens, and access tokens are encrypted with Fernet before th
 The public share domain is configured with `PUBLIC_SHARE_ORIGIN`. The main management interface is served from `/admin`; the public domain only accepts valid shared mailbox links.
 
 Shared links can be configured with an expiry period or revoked immediately. Expired and revoked tokens no longer expose mailbox content.
+
+Responses include a restrictive content security policy and standard browser security headers.
 
 ## Getting Started
 

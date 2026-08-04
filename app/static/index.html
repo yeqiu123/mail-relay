@@ -280,16 +280,23 @@
               <h2>别名管理</h2>
               <p>按隐藏邮箱地址筛选归档邮件并生成独立链接</p>
             </div>
-            <button class="button primary" id="open-target-modal" type="button">
-              <i data-lucide="plus"></i>
-              <span>添加别名</span>
-            </button>
+            <div class="target-toolbar">
+              <label class="search-box" for="target-search">
+                <i data-lucide="search"></i>
+                <input id="target-search" type="search" autocomplete="off" placeholder="搜索别名或标签" aria-label="搜索别名或标签">
+              </label>
+              <button class="button primary" id="open-target-modal" type="button">
+                <i data-lucide="plus"></i>
+                <span>添加别名</span>
+              </button>
+            </div>
           </div>
           <div class="table-wrap targets-table-wrap">
             <table class="data-table targets-table">
               <colgroup>
                 <col class="target-email-column">
                 <col class="target-account-column">
+                <col class="target-tags-column">
                 <col class="target-count-column">
                 <col class="target-status-column">
                 <col class="target-time-column">
@@ -299,6 +306,7 @@
                 <tr>
                   <th>别名邮箱</th>
                   <th>归属邮箱</th>
+                  <th>标签</th>
                   <th>已归档</th>
                   <th>状态</th>
                   <th>创建时间</th>
@@ -555,12 +563,45 @@
             <span>隐藏邮箱别名</span>
             <input class="text-control" id="target-email-input" type="email" autocomplete="off" placeholder="alias@example.com" required>
           </label>
+          <label class="field">
+            <span>标签</span>
+            <input class="text-control" id="target-new-tags-input" autocomplete="off" placeholder="例如：注册，重要">
+          </label>
         </div>
         <footer class="modal-foot">
           <button class="button close-target-modal" type="button">取消</button>
           <button class="button primary" type="submit">
             <i data-lucide="plus"></i>
             <span>添加别名</span>
+          </button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="target-tags-overlay" aria-hidden="true">
+    <section class="modal target-modal" role="dialog" aria-modal="true" aria-labelledby="target-tags-title">
+      <header class="modal-head">
+        <div>
+          <h2 id="target-tags-title">编辑标签</h2>
+          <p id="target-tags-subtitle"></p>
+        </div>
+        <button class="icon-button close-target-tags-modal" type="button" aria-label="关闭" title="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <form id="target-tags-form">
+        <div class="modal-body target-form-body">
+          <label class="field">
+            <span>标签</span>
+            <input class="text-control" id="target-tags-input" autocomplete="off" placeholder="例如：注册，重要">
+          </label>
+        </div>
+        <footer class="modal-foot">
+          <button class="button close-target-tags-modal" type="button">取消</button>
+          <button class="button primary" type="submit">
+            <i data-lucide="save"></i>
+            <span>保存标签</span>
           </button>
         </footer>
       </form>

@@ -207,6 +207,35 @@ class Store:
         )
 
     @staticmethod
+    def _create_mail_tags_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mail_tags (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id    INTEGER NOT NULL,
+                name        TEXT NOT NULL COLLATE NOCASE,
+                created_at  INTEGER NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE(owner_id, name)
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_mail_target_tags_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mail_target_tags (
+                target_id  INTEGER NOT NULL,
+                tag_id     INTEGER NOT NULL,
+                PRIMARY KEY(target_id, tag_id),
+                FOREIGN KEY(target_id) REFERENCES mail_targets(id) ON DELETE CASCADE,
+                FOREIGN KEY(tag_id) REFERENCES mail_tags(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+    @staticmethod
     def _ensure_share_link_columns(connection: sqlite3.Connection) -> None:
         for table in ("share_links", "target_share_links"):
             columns = Store._columns(connection, table)
@@ -393,6 +422,8 @@ class Store:
             self._create_mail_recipients_table(connection)
             self._create_mail_targets_table(connection)
             self._create_target_share_links_table(connection)
+            self._create_mail_tags_table(connection)
+            self._create_mail_target_tags_table(connection)
             self._ensure_share_link_columns(connection)
             connection.executescript(
                 """
@@ -418,6 +449,10 @@ class Store:
                     ON mail_targets(owner_id, account_id);
                 CREATE INDEX IF NOT EXISTS idx_target_share_links_token
                     ON target_share_links(token);
+                CREATE INDEX IF NOT EXISTS idx_mail_tags_owner
+                    ON mail_tags(owner_id, name);
+                CREATE INDEX IF NOT EXISTS idx_mail_target_tags_tag
+                    ON mail_target_tags(tag_id, target_id);
                 """
             )
             connection.executemany(
@@ -922,6 +957,22 @@ class Store:
                 """,
                 (owner_id,),
             ).fetchall()
+            tag_rows = connection.execute(
+                """
+                SELECT mail_target_tags.target_id, mail_tags.name
+                FROM mail_target_tags
+                JOIN mail_tags ON mail_tags.id = mail_target_tags.tag_id
+                JOIN mail_targets ON mail_targets.id = mail_target_tags.target_id
+                WHERE mail_targets.owner_id = ?
+                ORDER BY mail_tags.name COLLATE NOCASE
+                """,
+                (owner_id,),
+            ).fetchall()
+        tags_by_target: dict[int, list[str]] = {}
+        for tag_row in tag_rows:
+            tags_by_target.setdefault(int(tag_row["target_id"]), []).append(
+                str(tag_row["name"])
+            )
         return [
             {
                 "id": int(row["id"]),
@@ -930,6 +981,7 @@ class Store:
                 "email": row["email"],
                 "enabled": bool(row["enabled"]),
                 "message_count": int(row["message_count"] or 0),
+                "tags": tags_by_target.get(int(row["id"]), []),
                 "created_at": int(row["created_at"]),
                 "updated_at": int(row["updated_at"]),
             }
@@ -985,6 +1037,57 @@ class Store:
             "created_at": now,
             "updated_at": now,
         }
+
+    def set_mail_target_tags(
+        self,
+        owner_id: int,
+        target_id: int,
+        tags: Iterable[str],
+    ) -> list[str]:
+        normalized_tags: list[str] = []
+        seen: set[str] = set()
+        for raw_tag in tags:
+            tag = str(raw_tag).strip()
+            key = tag.casefold()
+            if not tag or key in seen:
+                continue
+            if len(tag) > 30:
+                raise ValueError("标签不能超过 30 个字符")
+            seen.add(key)
+            normalized_tags.append(tag)
+
+        with self._write_lock, self._connect() as connection:
+            target = connection.execute(
+                "SELECT id FROM mail_targets WHERE id = ? AND owner_id = ?",
+                (target_id, owner_id),
+            ).fetchone()
+            if not target:
+                raise ValueError("别名不存在")
+            connection.execute(
+                "DELETE FROM mail_target_tags WHERE target_id = ?",
+                (target_id,),
+            )
+            for tag in normalized_tags:
+                row = connection.execute(
+                    "SELECT id FROM mail_tags WHERE owner_id = ? AND name = ? COLLATE NOCASE",
+                    (owner_id, tag),
+                ).fetchone()
+                if row:
+                    tag_id = int(row["id"])
+                else:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO mail_tags(owner_id, name, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (owner_id, tag, int(time.time())),
+                    )
+                    tag_id = int(cursor.lastrowid)
+                connection.execute(
+                    "INSERT INTO mail_target_tags(target_id, tag_id) VALUES (?, ?)",
+                    (target_id, tag_id),
+                )
+        return normalized_tags
 
     def set_mail_target_enabled(
         self,

@@ -16,6 +16,8 @@ const state = {
   users: [],
   targets: [],
   targetAccounts: [],
+  targetSearch: "",
+  targetTagsEditingId: null,
   userModalMode: "create",
   userEditingId: null,
   shareUrl: "",
@@ -611,33 +613,46 @@ async function exportAccounts() {
 
 async function loadTargets() {
   const tbody = $("#targets-tbody");
-  renderTableLoading(tbody, 6);
+  renderTableLoading(tbody, 7);
   try {
     const result = await api("/api/targets");
     state.targets = Array.isArray(result.items) ? result.items : [];
     renderTargets(state.targets);
   } catch (error) {
-    if (!error.authExpired) renderTableError(tbody, 6, error.message);
+    if (!error.authExpired) renderTableError(tbody, 7, error.message);
   }
 }
 
 function renderTargets(targets) {
   const tbody = $("#targets-tbody");
-  if (!targets.length) {
+  const keyword = state.targetSearch.toLocaleLowerCase();
+  const visibleTargets = keyword
+    ? targets.filter((target) => [
+      target.email,
+      target.account_email,
+      ...(Array.isArray(target.tags) ? target.tags : []),
+    ].some((value) => String(value || "").toLocaleLowerCase().includes(keyword)))
+    : targets;
+  if (!visibleTargets.length) {
+    const filtered = Boolean(keyword);
     tbody.innerHTML = `
       <tr>
-        <td class="empty-cell" colspan="6">
+        <td class="empty-cell" colspan="7">
           <div class="empty-state">
-            <i data-lucide="at-sign"></i>
-            <strong>尚未添加别名</strong>
-            <span>为 Outlook 邮箱添加隐藏邮箱地址后，可生成独立共享链接</span>
+            <i data-lucide="${filtered ? "search-x" : "at-sign"}"></i>
+            <strong>${filtered ? "没有匹配的别名" : "尚未添加别名"}</strong>
+            <span>${filtered ? "调整搜索条件" : "为 Outlook 邮箱添加隐藏邮箱地址后，可生成独立共享链接"}</span>
           </div>
         </td>
       </tr>
     `;
   } else {
-    tbody.innerHTML = targets.map((target) => {
+    tbody.innerHTML = visibleTargets.map((target) => {
       const enabled = Boolean(target.enabled);
+      const tags = Array.isArray(target.tags) ? target.tags : [];
+      const tagsHtml = tags.length
+        ? tags.map((tag) => `<span class="target-tag">${escapeHtml(tag)}</span>`).join("")
+        : '<span class="target-tag-empty">—</span>';
       return `
         <tr data-target-id="${target.id}">
           <td class="email-cell">
@@ -647,6 +662,7 @@ function renderTargets(targets) {
             </button>
           </td>
           <td class="email-cell"><strong title="${escapeHtml(target.account_email)}">${escapeHtml(target.account_email)}</strong></td>
+          <td><div class="target-tag-list">${tagsHtml}</div></td>
           <td><span class="user-count">${Number(target.message_count || 0)}</span></td>
           <td><span class="status ${enabled ? "active" : "user-disabled"}">${enabled ? "启用" : "已停用"}</span></td>
           <td class="time-cell">${formatTime(target.created_at)}</td>
@@ -654,6 +670,9 @@ function renderTargets(targets) {
             <div class="row-actions">
               <button class="row-action" type="button" data-target-action="share" data-id="${target.id}" aria-label="生成共享链接" title="生成共享链接">
                 <i data-lucide="link"></i>
+              </button>
+              <button class="row-action" type="button" data-target-action="tags" data-id="${target.id}" aria-label="编辑标签" title="编辑标签">
+                <i data-lucide="tags"></i>
               </button>
               <button class="row-action" type="button" data-target-action="toggle" data-id="${target.id}" aria-label="${enabled ? "停用别名" : "启用别名"}" title="${enabled ? "停用别名" : "启用别名"}">
                 <i data-lucide="power"></i>
@@ -667,8 +686,14 @@ function renderTargets(targets) {
       `;
     }).join("");
   }
-  $("#targets-total").textContent = `共 ${targets.length} 个别名`;
+  $("#targets-total").textContent = keyword
+    ? `显示 ${visibleTargets.length} / ${targets.length} 个别名`
+    : `共 ${targets.length} 个别名`;
   refreshIcons(tbody);
+}
+
+function parseTargetTags(value) {
+  return value.split(/[，,]/).map((tag) => tag.trim()).filter(Boolean);
 }
 
 async function openTargetModal() {
@@ -683,6 +708,7 @@ async function openTargetModal() {
       <option value="${account.id}">${escapeHtml(account.email)}</option>
     `).join("");
     $("#target-email-input").value = "";
+    $("#target-new-tags-input").value = "";
     showOverlay($("#target-overlay"), true);
     window.setTimeout(() => $("#target-email-input").focus(), 80);
   } catch (error) {
@@ -692,6 +718,19 @@ async function openTargetModal() {
 
 function closeTargetModal() {
   showOverlay($("#target-overlay"), false);
+}
+
+function openTargetTagsModal(target) {
+  state.targetTagsEditingId = Number(target.id);
+  $("#target-tags-subtitle").textContent = target.email;
+  $("#target-tags-input").value = (target.tags || []).join("，");
+  showOverlay($("#target-tags-overlay"), true);
+  window.setTimeout(() => $("#target-tags-input").focus(), 80);
+}
+
+function closeTargetTagsModal() {
+  showOverlay($("#target-tags-overlay"), false);
+  state.targetTagsEditingId = null;
 }
 
 async function submitTargetForm(event) {
@@ -704,10 +743,31 @@ async function submitTargetForm(event) {
       body: JSON.stringify({
         account_id: Number($("#target-account-select").value),
         email: $("#target-email-input").value.trim(),
+        tags: parseTargetTags($("#target-new-tags-input").value),
       }),
     });
     closeTargetModal();
     toast("别名已添加");
+    await loadTargets();
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function submitTargetTags(event) {
+  event.preventDefault();
+  if (!state.targetTagsEditingId) return;
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  setButtonBusy(button, true, "保存中");
+  try {
+    await api(`/api/targets/${state.targetTagsEditingId}/tags`, {
+      method: "PUT",
+      body: JSON.stringify({ tags: parseTargetTags($("#target-tags-input").value) }),
+    });
+    closeTargetTagsModal();
+    toast("标签已保存");
     await loadTargets();
   } catch (error) {
     if (!error.authExpired) toast(error.message, "error");
@@ -1398,12 +1458,21 @@ function bindEvents() {
   $("#copy-share-link").addEventListener("click", copyShareLink);
   $("#save-share-expiry").addEventListener("click", saveShareExpiry);
   $("#revoke-share-link").addEventListener("click", revokeShareLink);
+  $("#target-search").addEventListener("input", (event) => {
+    state.targetSearch = event.currentTarget.value.trim();
+    renderTargets(state.targets);
+  });
   $("#open-target-modal").addEventListener("click", openTargetModal);
   $$(".close-target-modal").forEach((button) => button.addEventListener("click", closeTargetModal));
   $("#target-overlay").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeTargetModal();
   });
   $("#target-form").addEventListener("submit", submitTargetForm);
+  $$(".close-target-tags-modal").forEach((button) => button.addEventListener("click", closeTargetTagsModal));
+  $("#target-tags-overlay").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeTargetTagsModal();
+  });
+  $("#target-tags-form").addEventListener("submit", submitTargetTags);
   $("#targets-tbody").addEventListener("click", (event) => {
     const button = event.target.closest("[data-target-action]");
     if (!button) return;
@@ -1411,6 +1480,7 @@ function bindEvents() {
     if (!target) return;
     if (button.dataset.targetAction === "copy-email") copyEmailAddress(target.email);
     if (button.dataset.targetAction === "share") generateTargetShareLink(target);
+    if (button.dataset.targetAction === "tags") openTargetTagsModal(target);
     if (button.dataset.targetAction === "toggle") toggleTarget(target);
     if (button.dataset.targetAction === "delete") deleteTarget(target);
   });
@@ -1449,6 +1519,7 @@ function bindEvents() {
     closeImport();
     closeShareLink();
     closeTargetModal();
+    closeTargetTagsModal();
     closeDrawer();
     closeSidebar();
     if (state.confirmResolve) resolveConfirm(false);

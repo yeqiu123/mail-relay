@@ -76,6 +76,30 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next: Any) -> Response:
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=()"
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    )
+    if request.url.scheme == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=config.session_secret,
@@ -111,10 +135,15 @@ class ShareLinkExpiryPayload(BaseModel):
 class MailTargetPayload(BaseModel):
     account_id: int = Field(ge=1)
     email: str = Field(min_length=3, max_length=320)
+    tags: list[str] = Field(default_factory=list, max_length=20)
 
 
 class MailTargetStatusPayload(BaseModel):
     enabled: bool
+
+
+class MailTargetTagsPayload(BaseModel):
+    tags: list[str] = Field(default_factory=list, max_length=20)
 
 
 class SettingsPayload(BaseModel):
@@ -678,12 +707,21 @@ async def create_mail_target(
     email_address = payload.email.strip().lower()
     if not EMAIL_PATTERN.match(email_address):
         raise HTTPException(status_code=422, detail="别名邮箱格式无效")
+    if any(len(tag.strip()) > 30 for tag in payload.tags):
+        raise HTTPException(status_code=422, detail="标签不能超过 30 个字符")
     try:
-        return store.create_mail_target(
+        target = store.create_mail_target(
             int(user["id"]), payload.account_id, email_address
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        target["tags"] = store.set_mail_target_tags(
+            int(user["id"]), int(target["id"]), payload.tags
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return target
 
 
 @app.patch("/api/targets/{target_id}")
@@ -698,6 +736,20 @@ async def update_mail_target(
     if not updated:
         raise HTTPException(status_code=404, detail="别名不存在")
     return {"ok": True}
+
+
+@app.put("/api/targets/{target_id}/tags")
+async def update_mail_target_tags(
+    target_id: int,
+    payload: MailTargetTagsPayload,
+    user: CurrentUser,
+) -> dict[str, list[str]]:
+    try:
+        tags = store.set_mail_target_tags(int(user["id"]), target_id, payload.tags)
+    except ValueError as exc:
+        status_code = 404 if str(exc) == "别名不存在" else 422
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {"tags": tags}
 
 
 @app.delete("/api/targets/{target_id}")
