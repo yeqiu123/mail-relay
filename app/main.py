@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import re
 import secrets
 import string
@@ -19,7 +18,12 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .config import config
 from .imap_client import MailboxError, OutlookMailbox
-from .microsoft import MicrosoftTokenService, RefreshCoordinator, TokenRefreshError
+from .microsoft import (
+    MailArchiveCoordinator,
+    MicrosoftTokenService,
+    RefreshCoordinator,
+    TokenRefreshError,
+)
 from .security import Vault
 from .store import Store
 
@@ -44,15 +48,25 @@ refresh_coordinator = RefreshCoordinator(
     config.scheduler_seconds,
 )
 mailbox = OutlookMailbox(config.imap_host, config.imap_port)
+mail_archive_coordinator = MailArchiveCoordinator(
+    store,
+    token_service,
+    mailbox,
+    config.refresh_workers,
+    config.scheduler_seconds,
+    config.mail_sync_interval_seconds,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.initialize(config.admin_username, config.admin_password)
     await refresh_coordinator.start()
+    await mail_archive_coordinator.start()
     try:
         yield
     finally:
+        await mail_archive_coordinator.stop()
         await refresh_coordinator.stop()
         await token_service.close()
 
@@ -446,32 +460,29 @@ async def public_mail_view(
             headers={"Cache-Control": "no-store"},
         )
 
-    try:
-        access_token = await token_service.get_access_token(int(account["id"]))
-        result = await asyncio.to_thread(
-            mailbox.list_messages_page,
-            account["email"],
-            access_token,
-            1,
-            PUBLIC_MAIL_PAGE_SIZE,
-        )
-    except TokenRefreshError as exc:
-        return HTMLResponse(
-            public_error_page("暂时无法读取邮件", exc.description),
-            status_code=502,
-            headers={"Cache-Control": "no-store"},
-        )
-    except MailboxError as exc:
-        store.set_mail_error(int(account["id"]), str(exc))
-        return HTMLResponse(
-            public_error_page("暂时无法读取邮件", str(exc)),
-            status_code=502,
-            headers={"Cache-Control": "no-store"},
-        )
+    if "refresh" in request.query_params:
+        try:
+            await mail_archive_coordinator.sync_account(int(account["id"]))
+        except TokenRefreshError as exc:
+            return HTMLResponse(
+                public_error_page("暂时无法读取邮件", exc.description),
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
+        except MailboxError as exc:
+            return HTMLResponse(
+                public_error_page("暂时无法读取邮件", str(exc)),
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
 
-    now = int(time.time())
+    result = store.list_archived_messages(
+        int(account["owner_id"]),
+        int(account["id"]),
+        1,
+        PUBLIC_MAIL_PAGE_SIZE,
+    )
     store.mark_share_access(token)
-    store.update_last_mail(int(account["id"]), now)
     return HTMLResponse(
         render_public_mail_page(token, account["email"], result),
         headers={"Cache-Control": "no-store"},
@@ -514,6 +525,7 @@ async def dashboard(user: CurrentUser) -> dict[str, object]:
     return {
         "accounts": store.dashboard_stats(int(user["id"])),
         "service": refresh_coordinator.status(),
+        "mail_archive": mail_archive_coordinator.status(),
     }
 
 
@@ -622,24 +634,38 @@ async def list_messages(account_id: int, user: CurrentUser) -> dict[str, object]
     if not account:
         raise HTTPException(status_code=404, detail="邮箱不存在")
 
+    result = store.list_archived_messages(
+        int(user["id"]),
+        account_id,
+        1,
+        int(store.get_settings()["mail_page_size"]),
+    )
+    return {
+        "email": account["email"],
+        "last_mail_at": account["last_mail_at"],
+        **result,
+    }
+
+
+@app.post("/api/accounts/{account_id}/messages/sync")
+async def sync_messages(account_id: int, user: CurrentUser) -> dict[str, object]:
+    account = store.get_account(account_id, int(user["id"]))
+    if not account:
+        raise HTTPException(status_code=404, detail="邮箱不存在")
     try:
-        limit = int(store.get_settings()["mail_page_size"])
-        access_token = await token_service.get_access_token(account_id)
-        messages = await asyncio.to_thread(
-            mailbox.list_messages,
-            account["email"],
-            access_token,
-            limit,
-        )
+        sync_result = await mail_archive_coordinator.sync_account(account_id)
     except TokenRefreshError as exc:
         raise HTTPException(status_code=502, detail=exc.description) from exc
     except MailboxError as exc:
-        store.set_mail_error(account_id, str(exc))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    last_mail_at = int(time.time())
-    store.update_last_mail(account_id, last_mail_at)
-    return {"email": account["email"], "items": messages, "last_mail_at": last_mail_at}
+    result = store.list_archived_messages(
+        int(user["id"]),
+        account_id,
+        1,
+        int(store.get_settings()["mail_page_size"]),
+    )
+    return {"email": account["email"], **sync_result, **result}
 
 
 @app.get("/api/accounts/{account_id}/messages/{uid}")
@@ -652,20 +678,9 @@ async def get_message(
     if not account:
         raise HTTPException(status_code=404, detail="邮箱不存在")
 
-    try:
-        access_token = await token_service.get_access_token(account_id)
-        message = await asyncio.to_thread(
-            mailbox.get_message,
-            account["email"],
-            access_token,
-            uid,
-        )
-    except TokenRefreshError as exc:
-        raise HTTPException(status_code=502, detail=exc.description) from exc
-    except MailboxError as exc:
-        store.set_mail_error(account_id, str(exc))
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
+    message = store.get_archived_message(int(user["id"]), account_id, uid)
+    if not message:
+        raise HTTPException(status_code=404, detail="归档中没有这封邮件，请先刷新收件箱")
     return message
 
 

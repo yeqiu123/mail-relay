@@ -23,4 +23,4 @@ The public share domain is configured with `PUBLIC_SHARE_ORIGIN`. The main manag
 2. Run `docker compose up -d --build`.
 3. The container listens on `127.0.0.1:8765`; place Nginx or another HTTPS reverse proxy in front of it.
 
-The browser does not poll the mailbox list automatically. The background refresh service rotates tokens at the configured interval, which defaults to seven days. A refresh token can still be invalidated by revoked consent, password changes, account protection, or Microsoft policy.
+The browser does not poll the mailbox list automatically. A background archive worker synchronizes the latest configured mailbox window every `MAIL_SYNC_INTERVAL_SECONDS` (five minutes by default), and shared links read that local archive. The token refresh worker rotates tokens at the configured interval, which defaults to seven days. A refresh token can still be invalidated by revoked consent, password changes, account protection, or Microsoft policy.

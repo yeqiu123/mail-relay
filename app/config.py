@@ -26,6 +26,7 @@ class AppConfig:
     token_scope: str
     refresh_workers: int
     scheduler_seconds: int
+    mail_sync_interval_seconds: int
     public_share_origin: str
 
     @classmethod
@@ -47,6 +48,9 @@ class AppConfig:
             ).strip(),
             refresh_workers=max(1, min(8, int(os.getenv("REFRESH_WORKERS", "3")))),
             scheduler_seconds=max(60, int(os.getenv("SCHEDULER_SECONDS", "300"))),
+            mail_sync_interval_seconds=max(
+                60, int(os.getenv("MAIL_SYNC_INTERVAL_SECONDS", "300"))
+            ),
             public_share_origin=os.getenv(
                 "PUBLIC_SHARE_ORIGIN",
                 "https://temporary.yeqiu.loc.cc",

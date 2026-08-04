@@ -75,6 +75,7 @@ class Store:
                 last_refresh_at       INTEGER,
                 next_refresh_at       INTEGER,
                 last_mail_at          INTEGER,
+                last_archive_sync_at  INTEGER,
                 last_error            TEXT,
                 created_at            INTEGER NOT NULL,
                 updated_at            INTEGER NOT NULL,
@@ -120,6 +121,30 @@ class Store:
                 FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                 UNIQUE(owner_id, account_id)
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_mail_messages_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mail_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id        INTEGER NOT NULL,
+                account_id      INTEGER NOT NULL,
+                uid             TEXT NOT NULL,
+                message_id      TEXT,
+                subject         TEXT NOT NULL,
+                sender_name     TEXT,
+                sender_address  TEXT,
+                received_at     INTEGER,
+                body            TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                UNIQUE(account_id, uid)
             )
             """
         )
@@ -261,6 +286,10 @@ class Store:
                     )
                 if "icloud_alias" not in account_columns:
                     connection.execute("ALTER TABLE accounts ADD COLUMN icloud_alias TEXT")
+                if "last_archive_sync_at" not in account_columns:
+                    connection.execute(
+                        "ALTER TABLE accounts ADD COLUMN last_archive_sync_at INTEGER"
+                    )
 
             connection.execute(
                 "UPDATE accounts SET owner_id = ? WHERE owner_id IS NULL",
@@ -288,6 +317,7 @@ class Store:
                 (admin_id,),
             )
             self._create_share_links_table(connection)
+            self._create_mail_messages_table(connection)
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_accounts_owner
@@ -302,6 +332,10 @@ class Store:
                     ON share_links(token);
                 CREATE INDEX IF NOT EXISTS idx_share_links_account
                     ON share_links(account_id);
+                CREATE INDEX IF NOT EXISTS idx_mail_messages_account_received
+                    ON mail_messages(account_id, received_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_mail_messages_owner_account
+                    ON mail_messages(owner_id, account_id);
                 """
             )
             connection.executemany(
@@ -464,6 +498,7 @@ class Store:
             "last_refresh_at": row["last_refresh_at"],
             "next_refresh_at": row["next_refresh_at"],
             "last_mail_at": row["last_mail_at"],
+            "last_archive_sync_at": row["last_archive_sync_at"] if "last_archive_sync_at" in row.keys() else None,
             "last_error": row["last_error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -528,6 +563,7 @@ class Store:
                             encrypted_password,
                             record.get("client_id", ""),
                             encrypted_refresh,
+                            now,
                             now,
                             now,
                         ),
@@ -619,6 +655,144 @@ class Store:
         account["refresh_token"] = self.vault.decrypt(row["refresh_token_cipher"])
         account["access_token"] = self.vault.decrypt(row["access_token_cipher"])
         return account
+
+    @staticmethod
+    def _public_message(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "uid": row["uid"],
+            "message_id": row["message_id"],
+            "subject": row["subject"],
+            "sender_name": row["sender_name"],
+            "sender_address": row["sender_address"],
+            "received_at": row["received_at"],
+            "body": row["body"],
+        }
+
+    def archive_mail_messages(
+        self,
+        owner_id: int,
+        account_id: int,
+        messages: Iterable[dict[str, Any]],
+    ) -> int:
+        now = int(time.time())
+        count = 0
+        with self._write_lock, self._connect() as connection:
+            for message in messages:
+                uid = str(message.get("uid") or "").strip()
+                if not uid:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO mail_messages(
+                        owner_id, account_id, uid, message_id, subject,
+                        sender_name, sender_address, received_at, body,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, uid) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        message_id = excluded.message_id,
+                        subject = excluded.subject,
+                        sender_name = excluded.sender_name,
+                        sender_address = excluded.sender_address,
+                        received_at = excluded.received_at,
+                        body = excluded.body,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        owner_id,
+                        account_id,
+                        uid,
+                        str(message.get("message_id") or ""),
+                        str(message.get("subject") or "无主题"),
+                        str(message.get("sender_name") or ""),
+                        str(message.get("sender_address") or ""),
+                        message.get("received_at"),
+                        str(message.get("body") or ""),
+                        now,
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def list_archived_messages(
+        self,
+        owner_id: int,
+        account_id: int,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        offset = (page - 1) * page_size
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM mail_messages
+                    WHERE owner_id = ? AND account_id = ?
+                    """,
+                    (owner_id, account_id),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM mail_messages
+                WHERE owner_id = ? AND account_id = ?
+                ORDER BY received_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (owner_id, account_id, page_size, offset),
+            ).fetchall()
+        return {
+            "items": [self._public_message(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def get_archived_message(
+        self,
+        owner_id: int,
+        account_id: int,
+        uid: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM mail_messages
+                WHERE owner_id = ? AND account_id = ? AND uid = ?
+                """,
+                (owner_id, account_id, uid),
+            ).fetchone()
+        return self._public_message(row) if row else None
+
+    def due_archive_account_ids(self, interval_seconds: int) -> list[int]:
+        cutoff = int(time.time()) - interval_seconds
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM accounts
+                WHERE status IN ('active', 'pending')
+                  AND (
+                      last_archive_sync_at IS NULL
+                      OR last_archive_sync_at <= ?
+                  )
+                ORDER BY COALESCE(last_archive_sync_at, 0), id
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def mark_mail_archive_synced(self, account_id: int, timestamp: int | None = None) -> None:
+        value = timestamp or int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE accounts
+                SET last_archive_sync_at = ?, last_mail_at = ?, last_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (value, value, int(time.time()), account_id),
+            )
 
     def get_or_create_share_link(
         self,

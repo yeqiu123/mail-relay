@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from .config import AppConfig
+from .imap_client import MailboxError, OutlookMailbox
 from .store import Store
 
 
@@ -265,6 +266,123 @@ class RefreshCoordinator:
         while True:
             await asyncio.sleep(self.scheduler_seconds)
             await self.enqueue(self.store.due_account_ids())
+
+    def status(self) -> dict[str, int]:
+        return {
+            "queued": self.queue.qsize(),
+            "workers": self.worker_count,
+        }
+
+
+class MailArchiveCoordinator:
+    """后台归档最新邮件，公开访问始终读取本地缓存。"""
+
+    def __init__(
+        self,
+        store: Store,
+        token_service: MicrosoftTokenService,
+        mailbox: OutlookMailbox,
+        worker_count: int,
+        scheduler_seconds: int,
+        sync_interval_seconds: int,
+    ) -> None:
+        self.store = store
+        self.token_service = token_service
+        self.mailbox = mailbox
+        self.worker_count = worker_count
+        self.scheduler_seconds = scheduler_seconds
+        self.sync_interval_seconds = sync_interval_seconds
+        self.queue: asyncio.Queue[int] = asyncio.Queue()
+        self._queued_ids: set[int] = set()
+        self._queued_lock = asyncio.Lock()
+        self._sync_locks: dict[int, asyncio.Lock] = {}
+        self._tasks: list[asyncio.Task[Any]] = []
+
+    def _lock_for(self, account_id: int) -> asyncio.Lock:
+        lock = self._sync_locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sync_locks[account_id] = lock
+        return lock
+
+    async def start(self) -> None:
+        self._tasks = [
+            asyncio.create_task(self._worker(index), name=f"mail-archive-worker-{index}")
+            for index in range(self.worker_count)
+        ]
+        self._tasks.append(
+            asyncio.create_task(self._scheduler(), name="mail-archive-scheduler")
+        )
+        await self.enqueue(
+            self.store.due_archive_account_ids(self.sync_interval_seconds)
+        )
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    async def enqueue(self, account_ids: list[int]) -> int:
+        queued = 0
+        async with self._queued_lock:
+            for account_id in account_ids:
+                if account_id in self._queued_ids:
+                    continue
+                self._queued_ids.add(account_id)
+                self.queue.put_nowait(account_id)
+                queued += 1
+        return queued
+
+    async def sync_account(self, account_id: int) -> dict[str, int]:
+        async with self._lock_for(account_id):
+            account = self.store.get_account(account_id)
+            if not account:
+                raise TokenRefreshError("not_found", "邮箱不存在", True)
+            try:
+                access_token = await self.token_service.get_access_token(account_id)
+                limit = int(self.store.get_settings()["mail_page_size"])
+                messages = await asyncio.to_thread(
+                    self.mailbox.list_messages,
+                    account["email"],
+                    access_token,
+                    limit,
+                )
+            except (TokenRefreshError, MailboxError) as exc:
+                self.store.set_mail_error(account_id, str(exc))
+                raise
+
+            synced_at = int(time.time())
+            stored = self.store.archive_mail_messages(
+                int(account["owner_id"]), account_id, messages
+            )
+            self.store.mark_mail_archive_synced(account_id, synced_at)
+            return {"stored": stored, "last_mail_at": synced_at}
+
+    async def _worker(self, index: int) -> None:
+        del index
+        while True:
+            account_id = await self.queue.get()
+            try:
+                await self.sync_account(account_id)
+            except (TokenRefreshError, MailboxError):
+                pass
+            except Exception as exc:
+                self.store.set_mail_error(
+                    account_id, f"internal_error: {exc.__class__.__name__}"
+                )
+            finally:
+                async with self._queued_lock:
+                    self._queued_ids.discard(account_id)
+                self.queue.task_done()
+
+    async def _scheduler(self) -> None:
+        while True:
+            await asyncio.sleep(self.scheduler_seconds)
+            await self.enqueue(
+                self.store.due_archive_account_ids(self.sync_interval_seconds)
+            )
 
     def status(self) -> dict[str, int]:
         return {

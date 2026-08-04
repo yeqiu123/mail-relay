@@ -937,13 +937,13 @@ function openDrawer(account) {
   $("#mail-list").innerHTML = `
     <div class="mail-list-state">
       <span class="spinner"></span>
-      <span>正在连接收件箱</span>
+      <span>正在加载已归档邮件</span>
     </div>
   `;
   $("#mail-content").innerHTML = `
     <div class="empty-state compact">
       <i data-lucide="mail-open"></i>
-      <strong>正在读取邮件</strong>
+      <strong>正在读取本地归档</strong>
     </div>
   `;
   $("#drawer-scrim").classList.remove("hidden");
@@ -963,18 +963,20 @@ function closeDrawer() {
   window.setTimeout(() => $("#drawer-scrim").classList.add("hidden"), 180);
 }
 
-async function loadMailbox() {
+async function loadMailbox(refresh = false) {
   const account = state.mailAccount;
   if (!account) return;
   const mailList = $("#mail-list");
   mailList.innerHTML = `
     <div class="mail-list-state">
       <span class="spinner"></span>
-      <span>正在连接收件箱</span>
+      <span>${refresh ? "正在刷新收件箱" : "正在加载已归档邮件"}</span>
     </div>
   `;
   try {
-    const result = await api(`/api/accounts/${account.id}/messages`);
+    const result = refresh
+      ? await api(`/api/accounts/${account.id}/messages/sync`, { method: "POST" })
+      : await api(`/api/accounts/${account.id}/messages`);
     if (!state.mailAccount || state.mailAccount.id !== account.id) return;
     if (result.last_mail_at) {
       state.mailAccount.last_mail_at = result.last_mail_at;
@@ -993,7 +995,7 @@ async function loadMailbox() {
       $("#mail-content").innerHTML = `
         <div class="empty-state compact">
           <i data-lucide="mail"></i>
-          <strong>收件箱为空</strong>
+          <strong>暂无归档邮件</strong>
         </div>
       `;
       refreshIcons($("#mail-content"));
@@ -1188,7 +1190,7 @@ function bindEvents() {
 
   $("#close-drawer").addEventListener("click", closeDrawer);
   $("#drawer-scrim").addEventListener("click", closeDrawer);
-  $("#reload-mail").addEventListener("click", loadMailbox);
+  $("#reload-mail").addEventListener("click", () => loadMailbox(true));
   $("#drawer-email").addEventListener("click", (event) => {
     copyEmailAddress(event.currentTarget.dataset.email || "");
   });

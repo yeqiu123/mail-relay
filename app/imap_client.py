@@ -179,7 +179,7 @@ class OutlookMailbox:
                 status, payload = connection.uid(
                     "fetch",
                     uid.encode(),
-                    "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])",
+                    "(BODY.PEEK[]<0.1048576>)",
                 )
                 if status != "OK":
                     continue
@@ -193,6 +193,7 @@ class OutlookMailbox:
                         "sender_address": sender_address,
                         "received_at": _parse_date(parsed.get("Date")),
                         "message_id": str(parsed.get("Message-ID") or ""),
+                        "body": _body_text(parsed),
                     }
                 )
             return messages
