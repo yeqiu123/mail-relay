@@ -271,6 +271,7 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "�
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <link rel="stylesheet" href="/static/public-mail.css?v=20260804-public-refresh">
+  <script defer src="/static/public-mail.js?v=20260804-public-refresh"></script>
   <title>{escape(title)}</title>
 </head>
 <body>
@@ -438,54 +439,13 @@ def render_public_mail_page(
         </div>
         <div class="section-actions">
           <span class="matched-mailbox">邮箱 <strong>{escape(email_address)}</strong></span>
-          <button class="btn btn-primary" id="public-refresh" type="button">刷新新邮件</button>
+          <button class="btn btn-primary" id="public-refresh" type="button" data-refresh-url="/{escape(token)}/refresh">刷新新邮件</button>
         </div>
       </section>
       <section class="mail-list" id="public-mail-list" aria-live="polite">
         {render_public_mail_list(result)}
       </section>
     </main>
-    <script>
-      (() => {{
-        const button = document.getElementById("public-refresh");
-        const mailList = document.getElementById("public-mail-list");
-        if (!button || !mailList) return;
-
-        const buttonLabel = button.innerHTML;
-        button.addEventListener("click", async () => {{
-          if (button.disabled) return;
-
-          const previousError = mailList.querySelector(".public-refresh-error");
-          if (previousError) previousError.remove();
-          button.disabled = true;
-          button.innerHTML = '<span class="public-refresh-spinner" aria-hidden="true"></span><span>刷新中</span>';
-          mailList.setAttribute("aria-busy", "true");
-
-          try {{
-            const response = await fetch("/{token}/refresh", {{
-              method: "POST",
-              credentials: "same-origin",
-              headers: {{ Accept: "application/json" }},
-            }});
-            const payload = await response.json().catch(() => ({{}}));
-            if (!response.ok || !payload.html) {{
-              throw new Error(payload.detail || "刷新失败，请稍后再试。");
-            }}
-            mailList.innerHTML = payload.html;
-          }} catch (error) {{
-            const alert = document.createElement("p");
-            alert.className = "public-refresh-error";
-            alert.setAttribute("role", "alert");
-            alert.textContent = error instanceof Error ? error.message : "刷新失败，请稍后再试。";
-            mailList.prepend(alert);
-          }} finally {{
-            mailList.removeAttribute("aria-busy");
-            button.disabled = false;
-            button.innerHTML = buttonLabel;
-          }}
-        }});
-      }})();
-    </script>
     """
     return public_shell(f"{email_address} - 邮件查看", body, wide=True)
 
