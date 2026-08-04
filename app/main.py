@@ -62,11 +62,9 @@ mail_archive_coordinator = MailArchiveCoordinator(
 async def lifespan(_: FastAPI):
     store.initialize(config.admin_username, config.admin_password)
     await refresh_coordinator.start()
-    await mail_archive_coordinator.start()
     try:
         yield
     finally:
-        await mail_archive_coordinator.stop()
         await refresh_coordinator.stop()
         await token_service.close()
 
@@ -558,7 +556,6 @@ async def dashboard(user: CurrentUser) -> dict[str, object]:
     return {
         "accounts": store.dashboard_stats(int(user["id"])),
         "service": refresh_coordinator.status(),
-        "mail_archive": mail_archive_coordinator.status(),
     }
 
 

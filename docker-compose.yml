@@ -15,3 +15,13 @@ services:
       timeout: 8s
       retries: 3
       start_period: 15s
+
+  mail-relay-worker:
+    build: .
+    container_name: mail-relay-worker
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
