@@ -546,7 +546,7 @@ async function waitForRefreshJob(job) {
   return current;
 }
 
-async function queueRefresh(ids, { button = $("#refresh-button"), reloadMailbox = false } = {}) {
+async function queueRefresh(ids, { button = $("#refresh-button") } = {}) {
   if (state.refreshing) return;
   state.refreshing = true;
   showRefreshLoading({ preparing: true });
@@ -559,9 +559,6 @@ async function queueRefresh(ids, { button = $("#refresh-button"), reloadMailbox 
     updateRefreshLoading(started);
     const result = await waitForRefreshJob(started);
     if (state.view === "accounts") await loadAccounts();
-    if (reloadMailbox && state.mailAccount && ids.includes(state.mailAccount.id)) {
-      await loadMailbox();
-    }
     const message = result.total
       ? `校验完成：正常 ${result.succeeded} 个，异常 ${result.failed} 个`
       : "没有可校验邮箱";
@@ -573,6 +570,24 @@ async function queueRefresh(ids, { button = $("#refresh-button"), reloadMailbox 
     state.refreshing = false;
     setButtonBusy(button, false);
     updateSelectionUi();
+  }
+}
+
+async function refreshMailbox(button) {
+  const account = state.mailAccount;
+  if (!account || button.disabled) return;
+
+  setButtonBusy(button, true, "拉取中");
+  try {
+    // 收件箱内的刷新只同步最新邮件，不触发账户授权校验。
+    await api(`/api/accounts/${account.id}/messages/sync`, { method: "POST" });
+    if (!state.mailAccount || state.mailAccount.id !== account.id) return;
+    await loadMailbox();
+    toast("收件箱已更新");
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
   }
 }
 
@@ -1631,12 +1646,7 @@ function bindEvents() {
   $("#close-drawer").addEventListener("click", closeDrawer);
   $("#drawer-scrim").addEventListener("click", closeDrawer);
   $("#reload-mail").addEventListener("click", (event) => {
-    if (state.mailAccount) {
-      queueRefresh([state.mailAccount.id], {
-        button: event.currentTarget,
-        reloadMailbox: true,
-      });
-    }
+    refreshMailbox(event.currentTarget);
   });
   $("#drawer-email").addEventListener("click", (event) => {
     copyEmailAddress(event.currentTarget.dataset.email || "");
