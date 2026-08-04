@@ -2532,3 +2532,53 @@ textarea {
     min-height: 96px;
   }
 }
+
+/* 弹窗使用蓝白表面，避免深色遮罩将内容区压成灰色。 */
+.overlay {
+  background: rgba(37, 99, 235, 0.14);
+  backdrop-filter: blur(8px) saturate(1.12);
+  -webkit-backdrop-filter: blur(8px) saturate(1.12);
+}
+
+.modal {
+  border-color: rgba(191, 219, 254, 0.92);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 24px 60px rgba(37, 99, 235, 0.18), 0 3px 10px rgba(30, 41, 59, 0.10);
+  backdrop-filter: blur(26px) saturate(1.12);
+  -webkit-backdrop-filter: blur(26px) saturate(1.12);
+}
+
+.modal-head,
+.modal-foot {
+  border-color: rgba(148, 163, 184, 0.18);
+}
+
+.modal .icon-button,
+.modal .button:not(.primary):not(.danger) {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--ink-soft);
+}
+
+.modal .icon-button:hover,
+.modal .button:not(.primary):not(.danger):hover {
+  border-color: rgba(147, 197, 253, 0.9);
+  background: #eff6ff;
+  color: var(--accent);
+}
+
+.modal .text-control,
+.modal textarea {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.98);
+}
+
+.modal textarea {
+  background: #fbfdff;
+}
+
+.modal .format-strip {
+  border: 1px solid rgba(147, 197, 253, 0.58);
+  background: #eff6ff;
+  color: var(--accent);
+}
