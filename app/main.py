@@ -270,7 +270,7 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "�
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <link rel="stylesheet" href="/static/public-mail.css?v=20260804-mmp">
+  <link rel="stylesheet" href="/static/public-mail.css?v=20260804-public-refresh">
   <title>{escape(title)}</title>
 </head>
 <body>
@@ -391,11 +391,7 @@ def captcha_svg(answer: str) -> str:
 </svg>"""
 
 
-def render_public_mail_page(
-    token: str,
-    email_address: str,
-    result: dict[str, Any],
-) -> str:
+def render_public_mail_list(result: dict[str, Any]) -> str:
     items = result["items"]
     cards: list[str] = []
     for message in items:
@@ -424,7 +420,14 @@ def render_public_mail_page(
             """
         )
 
-    refresh_url = f"/{escape(token)}?refresh={int(time.time())}"
+    return "".join(cards)
+
+
+def render_public_mail_page(
+    token: str,
+    email_address: str,
+    result: dict[str, Any],
+) -> str:
     body = f"""
     <main class="public-content">
       <section class="section-heading">
@@ -435,13 +438,54 @@ def render_public_mail_page(
         </div>
         <div class="section-actions">
           <span class="matched-mailbox">邮箱 <strong>{escape(email_address)}</strong></span>
-          <a class="btn btn-primary" href="{refresh_url}">刷新新邮件</a>
+          <button class="btn btn-primary" id="public-refresh" type="button">刷新新邮件</button>
         </div>
       </section>
-      <section class="mail-list">
-        {"".join(cards)}
+      <section class="mail-list" id="public-mail-list" aria-live="polite">
+        {render_public_mail_list(result)}
       </section>
     </main>
+    <script>
+      (() => {{
+        const button = document.getElementById("public-refresh");
+        const mailList = document.getElementById("public-mail-list");
+        if (!button || !mailList) return;
+
+        const buttonLabel = button.innerHTML;
+        button.addEventListener("click", async () => {{
+          if (button.disabled) return;
+
+          const previousError = mailList.querySelector(".public-refresh-error");
+          if (previousError) previousError.remove();
+          button.disabled = true;
+          button.innerHTML = '<span class="public-refresh-spinner" aria-hidden="true"></span><span>刷新中</span>';
+          mailList.setAttribute("aria-busy", "true");
+
+          try {{
+            const response = await fetch("/{token}/refresh", {{
+              method: "POST",
+              credentials: "same-origin",
+              headers: {{ Accept: "application/json" }},
+            }});
+            const payload = await response.json().catch(() => ({{}}));
+            if (!response.ok || !payload.html) {{
+              throw new Error(payload.detail || "刷新失败，请稍后再试。");
+            }}
+            mailList.innerHTML = payload.html;
+          }} catch (error) {{
+            const alert = document.createElement("p");
+            alert.className = "public-refresh-error";
+            alert.setAttribute("role", "alert");
+            alert.textContent = error instanceof Error ? error.message : "刷新失败，请稍后再试。";
+            mailList.prepend(alert);
+          }} finally {{
+            mailList.removeAttribute("aria-busy");
+            button.disabled = false;
+            button.innerHTML = buttonLabel;
+          }}
+        }});
+      }})();
+    </script>
     """
     return public_shell(f"{email_address} - 邮件查看", body, wide=True)
 
@@ -450,6 +494,22 @@ def formatTimeForHtml(timestamp: Any) -> str:
     if not timestamp:
         return "未知时间"
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(timestamp)))
+
+
+def get_public_mail_result(account: dict[str, Any]) -> dict[str, Any]:
+    if account["target_id"]:
+        return store.list_target_archived_messages(
+            int(account["owner_id"]),
+            int(account["target_id"]),
+            1,
+            PUBLIC_MAIL_PAGE_SIZE,
+        )
+    return store.list_archived_messages(
+        int(account["owner_id"]),
+        int(account["id"]),
+        1,
+        PUBLIC_MAIL_PAGE_SIZE,
+    )
 
 
 @app.get("/admin")
@@ -543,23 +603,35 @@ async def public_mail_view(
                 headers={"Cache-Control": "no-store"},
             )
 
-    if account["target_id"]:
-        result = store.list_target_archived_messages(
-            int(account["owner_id"]),
-            int(account["target_id"]),
-            1,
-            PUBLIC_MAIL_PAGE_SIZE,
-        )
-    else:
-        result = store.list_archived_messages(
-            int(account["owner_id"]),
-            int(account["id"]),
-            1,
-            PUBLIC_MAIL_PAGE_SIZE,
-        )
+    result = get_public_mail_result(account)
     store.mark_share_access(token)
     return HTMLResponse(
         render_public_mail_page(token, account["shared_email"], result),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/{token}/refresh")
+async def refresh_public_mail(token: str, request: Request) -> JSONResponse:
+    if not TOKEN_PATTERN.match(token) or not is_public_host(request):
+        return JSONResponse({"detail": "链接不存在或已失效。"}, status_code=404)
+
+    account = store.get_shared_mailbox(token)
+    if not account:
+        return JSONResponse({"detail": "链接不存在或已失效。"}, status_code=404)
+    if not is_verified(request, token):
+        return JSONResponse({"detail": "请先完成验证码验证。"}, status_code=403)
+
+    try:
+        await mail_archive_coordinator.sync_account(int(account["id"]))
+    except TokenRefreshError as exc:
+        return JSONResponse({"detail": exc.description}, status_code=502)
+    except MailboxError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=502)
+
+    store.mark_share_access(token)
+    return JSONResponse(
+        {"html": render_public_mail_list(get_public_mail_result(account))},
         headers={"Cache-Control": "no-store"},
     )
 

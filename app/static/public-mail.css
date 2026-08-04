@@ -250,6 +250,12 @@ h2 {
 .mail-list {
   display: grid;
   gap: 12px;
+  transition: opacity var(--transition);
+}
+
+.mail-list[aria-busy="true"] {
+  opacity: 0.56;
+  pointer-events: none;
 }
 
 .mail-card {
@@ -322,14 +328,54 @@ h2 {
   transition: var(--transition);
 }
 
+button.btn {
+  cursor: pointer;
+  font: inherit;
+}
+
+.btn:disabled {
+  cursor: wait;
+  opacity: 0.78;
+}
+
 .btn:hover {
   transform: translateY(-1px);
+}
+
+.btn:disabled:hover {
+  transform: none;
 }
 
 .btn-primary {
   color: #ffffff;
   background: linear-gradient(135deg, var(--accent-light), var(--accent));
   box-shadow: 0 5px 14px rgba(37, 99, 235, 0.22);
+}
+
+.public-refresh-spinner {
+  width: 12px;
+  height: 12px;
+  margin-right: 7px;
+  border: 2px solid rgba(255, 255, 255, 0.42);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: public-refresh-spin 700ms linear infinite;
+}
+
+.public-refresh-error {
+  margin: 0;
+  padding: 11px 13px;
+  border: 1px solid rgba(220, 38, 38, 0.16);
+  border-radius: var(--radius-sm);
+  color: #991b1b;
+  background: rgba(254, 226, 226, 0.72);
+  font-size: 0.78rem;
+}
+
+@keyframes public-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .btn-secondary {
