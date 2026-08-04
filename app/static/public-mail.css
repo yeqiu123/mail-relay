@@ -36,11 +36,8 @@ body {
   min-height: 100vh;
   margin: 0;
   color: var(--text);
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.22) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.22) 1px, transparent 1px),
-    linear-gradient(135deg, #e3eafa 0%, #e8f1fb 48%, #eeeafa 100%);
-  background-size: 34px 34px, 34px 34px, auto;
+  background: linear-gradient(135deg, #e3eafa 0%, #e8f1fb 48%, #eef3f7 100%);
+  background-size: auto;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif;
   line-height: 1.6;
 }

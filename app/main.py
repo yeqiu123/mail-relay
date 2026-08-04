@@ -189,7 +189,7 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "å…
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <link rel="stylesheet" href="/static/public-mail.css">
+  <link rel="stylesheet" href="/static/public-mail.css?v=20260804-mmp">
   <title>{escape(title)}</title>
 </head>
 <body>
