@@ -445,8 +445,12 @@ class MailArchiveCoordinator:
                     access_token,
                     limit,
                 )
-            except (TokenRefreshError, MailboxError) as exc:
-                self.store.set_mail_error(account_id, str(exc))
+            except TokenRefreshError:
+                raise
+            except MailboxError as exc:
+                # 可重试的 IMAP 会话错误不应把可读取账户永久标为异常。
+                if exc.authentication_failed:
+                    self.store.set_mail_error(account_id, str(exc))
                 raise
 
             synced_at = int(time.time())

@@ -14,7 +14,26 @@ from typing import Any
 
 
 class MailboxError(RuntimeError):
-    pass
+    def __init__(self, message: str, authentication_failed: bool = False) -> None:
+        super().__init__(message)
+        self.authentication_failed = authentication_failed
+
+
+def _is_authentication_failure(message: str) -> bool:
+    """仅将明确的凭据拒绝视为账户授权异常。"""
+    value = message.lower()
+    if "authenticated but not connected" in value:
+        return False
+    return any(
+        marker in value
+        for marker in (
+            "authenticate failed",
+            "authenticationfailed",
+            "authentication failed",
+            "invalid credentials",
+            "invalid token",
+        )
+    )
 
 
 def _decode_header(value: str | None) -> str:
@@ -170,8 +189,14 @@ class OutlookMailbox:
             ).encode("utf-8")
             connection.authenticate("XOAUTH2", lambda _: auth_string)
             return connection
-        except (imaplib.IMAP4.error, OSError, ssl.SSLError) as exc:
-            raise MailboxError(f"IMAP XOAUTH2 认证失败：{exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            detail = str(exc)
+            raise MailboxError(
+                f"IMAP XOAUTH2 认证失败：{detail}",
+                _is_authentication_failure(detail),
+            ) from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailboxError(f"IMAP 连接失败：{exc}") from exc
 
     def list_messages(
         self,

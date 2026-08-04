@@ -433,6 +433,19 @@ class Store:
                 """
             )
 
+            # 旧版本会把 Outlook 的可重试会话响应误判为授权异常，升级时清理遗留状态。
+            connection.execute(
+                """
+                UPDATE accounts
+                SET last_error = CASE
+                        WHEN last_error = last_mail_error THEN NULL
+                        ELSE last_error
+                    END,
+                    last_mail_error = NULL
+                WHERE last_mail_error LIKE '%User is authenticated but not connected%'
+                """
+            )
+
             connection.execute(
                 "UPDATE accounts SET owner_id = ? WHERE owner_id IS NULL",
                 (admin_id,),
