@@ -118,6 +118,8 @@ class Store:
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
                 last_access_at  INTEGER,
+                expires_at      INTEGER,
+                revoked_at      INTEGER,
                 FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                 UNIQUE(owner_id, account_id)
@@ -195,11 +197,28 @@ class Store:
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
                 last_access_at  INTEGER,
+                expires_at      INTEGER,
+                revoked_at      INTEGER,
                 FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(target_id) REFERENCES mail_targets(id) ON DELETE CASCADE,
                 UNIQUE(owner_id, target_id)
             )
             """
+        )
+
+    @staticmethod
+    def _ensure_share_link_columns(connection: sqlite3.Connection) -> None:
+        for table in ("share_links", "target_share_links"):
+            columns = Store._columns(connection, table)
+            if "expires_at" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN expires_at INTEGER")
+            if "revoked_at" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN revoked_at INTEGER")
+
+    @staticmethod
+    def _link_is_active(row: sqlite3.Row, now: int) -> bool:
+        return row["revoked_at"] is None and (
+            row["expires_at"] is None or int(row["expires_at"]) > now
         )
 
     def _ensure_admin(
@@ -374,6 +393,7 @@ class Store:
             self._create_mail_recipients_table(connection)
             self._create_mail_targets_table(connection)
             self._create_target_share_links_table(connection)
+            self._ensure_share_link_columns(connection)
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_accounts_owner
@@ -1016,7 +1036,7 @@ class Store:
                 """,
                 (owner_id, target_id),
             ).fetchone()
-            if existing:
+            if existing and self._link_is_active(existing, now):
                 return {
                     "id": int(existing["id"]),
                     "target_id": target_id,
@@ -1026,18 +1046,33 @@ class Store:
                     "created_at": int(existing["created_at"]),
                     "updated_at": int(existing["updated_at"]),
                     "last_access_at": existing["last_access_at"],
+                    "expires_at": existing["expires_at"],
+                    "revoked_at": existing["revoked_at"],
                 }
             token = str(uuid.uuid4())
-            cursor = connection.execute(
-                """
-                INSERT INTO target_share_links(
-                    owner_id, target_id, token, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (owner_id, target_id, token, now, now),
-            )
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE target_share_links
+                    SET token = ?, expires_at = NULL, revoked_at = NULL,
+                        last_access_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (token, now, int(existing["id"])),
+                )
+                link_id = int(existing["id"])
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO target_share_links(
+                        owner_id, target_id, token, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (owner_id, target_id, token, now, now),
+                )
+                link_id = int(cursor.lastrowid)
         return {
-            "id": int(cursor.lastrowid),
+            "id": link_id,
             "target_id": target_id,
             "email": target["email"],
             "account_email": target["account_email"],
@@ -1045,6 +1080,8 @@ class Store:
             "created_at": now,
             "updated_at": now,
             "last_access_at": None,
+            "expires_at": None,
+            "revoked_at": None,
         }
 
     def list_target_archived_messages(
@@ -1117,7 +1154,7 @@ class Store:
                 """,
                 (owner_id, account_id),
             ).fetchone()
-            if existing:
+            if existing and self._link_is_active(existing, now):
                 return dict(existing)
 
             account = connection.execute(
@@ -1129,16 +1166,29 @@ class Store:
 
             # 共享链接使用随机 UUID 作为入口，不暴露内部账号 ID。
             token = str(uuid.uuid4())
-            cursor = connection.execute(
-                """
-                INSERT INTO share_links(
-                    owner_id, account_id, token, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (owner_id, account_id, token, now, now),
-            )
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE share_links
+                    SET token = ?, expires_at = NULL, revoked_at = NULL,
+                        last_access_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (token, now, int(existing["id"])),
+                )
+                link_id = int(existing["id"])
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO share_links(
+                        owner_id, account_id, token, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (owner_id, account_id, token, now, now),
+                )
+                link_id = int(cursor.lastrowid)
             return {
-                "id": int(cursor.lastrowid),
+                "id": link_id,
                 "owner_id": owner_id,
                 "account_id": account_id,
                 "email": account["email"],
@@ -1146,9 +1196,12 @@ class Store:
                 "created_at": now,
                 "updated_at": now,
                 "last_access_at": None,
+                "expires_at": None,
+                "revoked_at": None,
             }
 
     def get_shared_mailbox(self, token: str) -> dict[str, Any] | None:
+        now = int(time.time())
         with self._connect() as connection:
             row = connection.execute(
                 """
@@ -1163,8 +1216,13 @@ class Store:
                 JOIN accounts ON accounts.id = mail_targets.account_id
                 WHERE target_share_links.token = ?
                   AND mail_targets.enabled = 1
+                  AND target_share_links.revoked_at IS NULL
+                  AND (
+                      target_share_links.expires_at IS NULL
+                      OR target_share_links.expires_at > ?
+                  )
                 """,
-                (token,),
+                (token, now),
             ).fetchone()
             if not row:
                 row = connection.execute(
@@ -1178,8 +1236,13 @@ class Store:
                     FROM share_links
                     JOIN accounts ON accounts.id = share_links.account_id
                     WHERE share_links.token = ?
+                      AND share_links.revoked_at IS NULL
+                      AND (
+                          share_links.expires_at IS NULL
+                          OR share_links.expires_at > ?
+                      )
                     """,
-                    (token,),
+                    (token, now),
                 ).fetchone()
         if not row:
             return None
@@ -1204,6 +1267,57 @@ class Store:
                 "UPDATE target_share_links SET last_access_at = ?, updated_at = ? WHERE token = ?",
                 (now, now, token),
             )
+
+    def update_share_link_expiry(
+        self,
+        owner_id: int,
+        token: str,
+        expires_at: int | None,
+    ) -> bool:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE share_links
+                SET expires_at = ?, updated_at = ?
+                WHERE owner_id = ? AND token = ? AND revoked_at IS NULL
+                """,
+                (expires_at, now, owner_id, token),
+            )
+            if cursor.rowcount > 0:
+                return True
+            cursor = connection.execute(
+                """
+                UPDATE target_share_links
+                SET expires_at = ?, updated_at = ?
+                WHERE owner_id = ? AND token = ? AND revoked_at IS NULL
+                """,
+                (expires_at, now, owner_id, token),
+            )
+        return cursor.rowcount > 0
+
+    def revoke_share_link(self, owner_id: int, token: str) -> bool:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE share_links
+                SET revoked_at = ?, updated_at = ?
+                WHERE owner_id = ? AND token = ? AND revoked_at IS NULL
+                """,
+                (now, now, owner_id, token),
+            )
+            if cursor.rowcount > 0:
+                return True
+            cursor = connection.execute(
+                """
+                UPDATE target_share_links
+                SET revoked_at = ?, updated_at = ?
+                WHERE owner_id = ? AND token = ? AND revoked_at IS NULL
+                """,
+                (now, now, owner_id, token),
+            )
+        return cursor.rowcount > 0
 
     def existing_ids(
         self,

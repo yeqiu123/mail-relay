@@ -18,6 +18,8 @@ Passwords, refresh tokens, and access tokens are encrypted with Fernet before th
 
 The public share domain is configured with `PUBLIC_SHARE_ORIGIN`. The main management interface is served from `/admin`; the public domain only accepts valid shared mailbox links.
 
+Shared links can be configured with an expiry period or revoked immediately. Expired and revoked tokens no longer expose mailbox content.
+
 ## Getting Started
 
 1. Copy `.env.example` to `.env` and set real secrets and administrator credentials.

@@ -106,6 +106,10 @@ class ShareLinkPayload(BaseModel):
     account_id: int = Field(ge=1)
 
 
+class ShareLinkExpiryPayload(BaseModel):
+    expires_in_days: int = Field(ge=0, le=365)
+
+
 class MailTargetPayload(BaseModel):
     account_id: int = Field(ge=1)
     email: str = Field(min_length=3, max_length=320)
@@ -202,6 +206,18 @@ def parse_import(content: str) -> list[dict[str, str]]:
 
     records.extend(unique_records.values())
     return records
+
+
+def share_link_response(link: dict[str, Any]) -> dict[str, object]:
+    token = str(link["token"])
+    return {
+        "email": str(link["email"]),
+        "token": token,
+        "path": f"/{token}",
+        "url": f"{config.public_share_origin}/{token}",
+        "expires_at": link.get("expires_at"),
+        "last_access_at": link.get("last_access_at"),
+    }
 
 
 def public_shell(title: str, body: str, *, wide: bool = False, status: str = "共享收件箱") -> str:
@@ -632,17 +648,12 @@ async def export_accounts(
 async def create_share_link(
     payload: ShareLinkPayload,
     user: CurrentUser,
-) -> dict[str, str]:
+) -> dict[str, object]:
     try:
         link = store.get_or_create_share_link(int(user["id"]), payload.account_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {
-        "email": str(link["email"]),
-        "token": str(link["token"]),
-        "path": f"/{link['token']}",
-        "url": f"{config.public_share_origin}/{link['token']}",
-    }
+    return share_link_response(link)
 
 
 @app.get("/api/accounts/options")
@@ -704,17 +715,43 @@ async def delete_mail_target(target_id: int, user: CurrentUser) -> dict[str, boo
 async def create_target_share_link(
     target_id: int,
     user: CurrentUser,
-) -> dict[str, str]:
+) -> dict[str, object]:
     try:
         link = store.get_or_create_target_share_link(int(user["id"]), target_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {
-        "email": str(link["email"]),
-        "token": str(link["token"]),
-        "path": f"/{link['token']}",
-        "url": f"{config.public_share_origin}/{link['token']}",
-    }
+    return share_link_response(link)
+
+
+@app.put("/api/shares/{token}")
+async def update_share_link_expiry(
+    token: str,
+    payload: ShareLinkExpiryPayload,
+    user: CurrentUser,
+) -> dict[str, int | None]:
+    if not TOKEN_PATTERN.match(token):
+        raise HTTPException(status_code=404, detail="共享链接不存在")
+    expires_at = (
+        int(time.time()) + payload.expires_in_days * 24 * 60 * 60
+        if payload.expires_in_days
+        else None
+    )
+    updated = store.update_share_link_expiry(
+        int(user["id"]), token, expires_at
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="共享链接不存在或已撤销")
+    return {"expires_at": expires_at}
+
+
+@app.post("/api/shares/{token}/revoke")
+async def revoke_share_link(token: str, user: CurrentUser) -> dict[str, bool]:
+    if not TOKEN_PATTERN.match(token):
+        raise HTTPException(status_code=404, detail="共享链接不存在")
+    revoked = store.revoke_share_link(int(user["id"]), token)
+    if not revoked:
+        raise HTTPException(status_code=404, detail="共享链接不存在或已撤销")
+    return {"ok": True}
 
 
 @app.get("/api/accounts/{account_id}/messages")

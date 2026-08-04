@@ -19,6 +19,9 @@ const state = {
   userModalMode: "create",
   userEditingId: null,
   shareUrl: "",
+  shareToken: "",
+  shareExpiresAt: null,
+  shareLastAccessAt: null,
   confirmResolve: null,
 };
 
@@ -717,7 +720,7 @@ async function generateTargetShareLink(target) {
   try {
     const result = await api(`/api/targets/${target.id}/share`, { method: "POST" });
     const url = result.url || new URL(result.path, window.location.origin).href;
-    openShareLink(result.email, url);
+    openShareLink(result.email, url, result);
     toast("别名共享链接已生成");
   } catch (error) {
     if (!error.authExpired) toast(error.message, "error");
@@ -760,17 +763,44 @@ async function generateShareLink(accountId) {
       body: JSON.stringify({ account_id: accountId }),
     });
     const url = result.url || new URL(result.path, window.location.origin).href;
-    openShareLink(result.email, url);
+    openShareLink(result.email, url, result);
     toast("共享链接已生成");
   } catch (error) {
     if (!error.authExpired) toast(error.message, "error");
   }
 }
 
-function openShareLink(email, url) {
+function shareExpiryValue(expiresAt) {
+  if (!expiresAt) return "0";
+  const remaining = Math.max(
+    1,
+    Math.ceil((Number(expiresAt) * 1000 - Date.now()) / (24 * 60 * 60 * 1000)),
+  );
+  const values = [1, 7, 30, 90, 365];
+  return String(values.includes(remaining) ? remaining : "custom");
+}
+
+function renderShareDetails() {
+  const expires = state.shareExpiresAt
+    ? `有效至 ${formatTime(state.shareExpiresAt)}`
+    : "永久有效";
+  const accessed = state.shareLastAccessAt
+    ? `上次访问 ${formatTime(state.shareLastAccessAt)}`
+    : "尚未访问";
+  $("#share-expiry-select").value = shareExpiryValue(state.shareExpiresAt);
+  $("#share-link-meta").textContent = `${expires} · ${accessed}`;
+  $("#save-share-expiry").disabled = !state.shareToken;
+  $("#revoke-share-link").disabled = !state.shareToken;
+}
+
+function openShareLink(email, url, link = {}) {
   state.shareUrl = url;
+  state.shareToken = String(link.token || "");
+  state.shareExpiresAt = link.expires_at || null;
+  state.shareLastAccessAt = link.last_access_at || null;
   $("#share-email").textContent = email;
   $("#share-link-input").value = url;
+  renderShareDetails();
   showOverlay($("#share-overlay"), true);
   window.setTimeout(() => {
     $("#share-link-input").focus();
@@ -788,6 +818,49 @@ async function copyShareLink() {
     toast("链接已复制");
   } catch (error) {
     toast("复制失败，请检查浏览器权限", "error");
+  }
+}
+
+async function saveShareExpiry() {
+  if (!state.shareToken) return;
+  const expiresInDays = Number($("#share-expiry-select").value);
+  if (!Number.isInteger(expiresInDays)) {
+    toast("请选择新的有效期", "error");
+    return;
+  }
+  const button = $("#save-share-expiry");
+  setButtonBusy(button, true, "保存中");
+  try {
+    const result = await api(`/api/shares/${state.shareToken}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        expires_in_days: expiresInDays,
+      }),
+    });
+    state.shareExpiresAt = result.expires_at || null;
+    renderShareDetails();
+    toast("链接有效期已保存");
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function revokeShareLink() {
+  if (!state.shareToken) return;
+  const accepted = await askConfirm({
+    title: "撤销共享链接",
+    message: "撤销后该链接将立即失效，重新生成会得到新的链接。",
+    submitLabel: "确认撤销",
+  });
+  if (!accepted) return;
+  try {
+    await api(`/api/shares/${state.shareToken}/revoke`, { method: "POST" });
+    closeShareLink();
+    toast("共享链接已撤销");
+  } catch (error) {
+    if (!error.authExpired) toast(error.message, "error");
   }
 }
 
@@ -1323,6 +1396,8 @@ function bindEvents() {
     if (event.target === event.currentTarget) closeShareLink();
   });
   $("#copy-share-link").addEventListener("click", copyShareLink);
+  $("#save-share-expiry").addEventListener("click", saveShareExpiry);
+  $("#revoke-share-link").addEventListener("click", revokeShareLink);
   $("#open-target-modal").addEventListener("click", openTargetModal);
   $$(".close-target-modal").forEach((button) => button.addEventListener("click", closeTargetModal));
   $("#target-overlay").addEventListener("click", (event) => {

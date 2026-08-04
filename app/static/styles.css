@@ -1210,6 +1210,22 @@ textarea:focus {
   font-size: 11px;
 }
 
+.share-controls {
+  display: grid;
+  gap: 14px;
+  padding-top: 4px;
+}
+
+.share-link-meta {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.share-revoke {
+  justify-self: start;
+}
+
 .user-form-body {
   display: grid;
   gap: 18px;
