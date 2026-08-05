@@ -536,12 +536,12 @@ function hideRefreshLoading() {
   showOverlay($("#refresh-overlay"), false);
 }
 
-async function waitForRefreshJob(job) {
+async function waitForRefreshJob(job, onUpdate = updateRefreshLoading) {
   let current = job;
   while (!current.done) {
     await new Promise((resolve) => window.setTimeout(resolve, 650));
     current = await api(`/api/refresh-jobs/${encodeURIComponent(current.id)}`);
-    updateRefreshLoading(current);
+    if (onUpdate) onUpdate(current);
   }
   return current;
 }
@@ -580,7 +580,9 @@ async function refreshMailbox(button) {
   setButtonBusy(button, true, "拉取中");
   try {
     // 收件箱内的刷新只同步最新邮件，不触发账户授权校验。
-    await api(`/api/accounts/${account.id}/messages/sync`, { method: "POST" });
+    const started = await api(`/api/accounts/${account.id}/messages/sync`, { method: "POST" });
+    const result = await waitForRefreshJob(started, null);
+    if (result.failed) throw new Error(result.error || "收件箱刷新失败");
     if (!state.mailAccount || state.mailAccount.id !== account.id) return;
     await loadMailbox();
     toast("收件箱已更新");

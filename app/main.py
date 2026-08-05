@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 import secrets
 import string
@@ -17,14 +19,10 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from .config import config
-from .imap_client import MailboxError, OutlookMailbox
 from .microsoft import (
     DeviceAuthorizationError,
     FullRefreshCoordinator,
-    MailArchiveCoordinator,
     MicrosoftTokenService,
-    RefreshCoordinator,
-    TokenRefreshError,
 )
 from .security import Vault
 from .store import Store
@@ -37,44 +35,24 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]{3,50}$")
 TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 VALID_STATUSES = {"active", "pending", "error", "invalid"}
 CAPTCHA_TTL_SECONDS = 10 * 60
+PUBLIC_MAIL_PAGE_SIZE = 20
 PUBLIC_SHARE_HOST = (urlsplit(config.public_share_origin).hostname or "").lower()
 
 vault = Vault(config.encryption_key)
 store = Store(config.database_path, vault)
 token_service = MicrosoftTokenService(store, config)
-mailbox = OutlookMailbox(config.imap_host, config.imap_port)
-mail_archive_coordinator = MailArchiveCoordinator(
-    store,
-    token_service,
-    mailbox,
-    config.refresh_workers,
-    config.scheduler_seconds,
-    config.mail_sync_interval_seconds,
-)
-refresh_coordinator = RefreshCoordinator(
-    store,
-    token_service,
-    config.refresh_workers,
-    config.scheduler_seconds,
-)
 full_refresh_coordinator = FullRefreshCoordinator(
     store,
-    token_service,
-    mail_archive_coordinator,
-    config.refresh_workers,
+    worker_count=config.refresh_workers,
 )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.initialize(config.admin_username, config.admin_password)
-    await refresh_coordinator.start()
-    await full_refresh_coordinator.start()
     try:
         yield
     finally:
-        await full_refresh_coordinator.stop()
-        await refresh_coordinator.stop()
         await token_service.close()
 
 
@@ -269,8 +247,8 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "�
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <link rel="stylesheet" href="/static/public-mail.css?v=20260804-public-refresh">
-  <script defer src="/static/public-mail.js?v=20260804-public-refresh"></script>
+  <link rel="stylesheet" href="/static/public-mail.css?v=20260805-durable-refresh">
+  <script defer src="/static/public-mail.js?v=20260805-durable-refresh"></script>
   <title>{escape(title)}</title>
 </head>
 <body>
@@ -330,6 +308,15 @@ def captcha_key(token: str) -> str:
     return f"public_captcha:{token}"
 
 
+def captcha_digest(challenge_id: str, answer: str) -> str:
+    value = f"{challenge_id}:{answer.lower()}".encode("utf-8")
+    return hmac.new(
+        config.session_secret.encode("utf-8"),
+        value,
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def is_verified(request: Request, token: str) -> bool:
     verified_at = request.session.get(verified_key(token))
     return isinstance(verified_at, int) and verified_at > int(time.time()) - 12 * 60 * 60
@@ -368,7 +355,7 @@ def render_captcha_page(token: str, error: str = "") -> str:
 
 
 def captcha_svg(answer: str) -> str:
-    # 轻量 SVG 验证码，答案保存在签名会话 Cookie 中。
+    # 轻量 SVG 验证码，浏览器只保存随机挑战 ID。
     chars = []
     for index, char in enumerate(answer):
         x = 46 + index * 24 + secrets.randbelow(5)
@@ -423,6 +410,34 @@ def render_public_mail_list(result: dict[str, Any]) -> str:
     return "".join(cards)
 
 
+def render_public_mail_region(token: str, result: dict[str, Any]) -> str:
+    page = int(result["page"])
+    page_size = int(result["page_size"])
+    total = int(result["total"])
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    pager = ""
+    if total_pages > 1:
+        previous = (
+            f'<a class="btn btn-secondary" href="/{escape(token)}?page={page - 1}">上一页</a>'
+            if page > 1
+            else ""
+        )
+        next_page = (
+            f'<a class="btn btn-secondary" href="/{escape(token)}?page={page + 1}">下一页</a>'
+            if page < total_pages
+            else ""
+        )
+        pager = (
+            f'<nav class="pager" aria-label="邮件分页">{previous}'
+            f'<span class="pager-status">{page} / {total_pages}</span>{next_page}</nav>'
+        )
+    return (
+        '<section class="mail-region" id="public-mail-region">'
+        f'<div class="mail-list" id="public-mail-list" aria-live="polite">'
+        f'{render_public_mail_list(result)}</div>{pager}</section>'
+    )
+
+
 def render_public_mail_page(
     token: str,
     email_address: str,
@@ -438,12 +453,10 @@ def render_public_mail_page(
         </div>
         <div class="section-actions">
           <span class="matched-mailbox">邮箱 <strong>{escape(email_address)}</strong></span>
-          <button class="btn btn-primary" id="public-refresh" type="button" data-refresh-url="/{escape(token)}/refresh">刷新新邮件</button>
+          <button class="btn btn-primary" id="public-refresh" type="button" data-refresh-url="/{escape(token)}/refresh?page={int(result['page'])}">刷新新邮件</button>
         </div>
       </section>
-      <section class="mail-list" id="public-mail-list" aria-live="polite">
-        {render_public_mail_list(result)}
-      </section>
+      {render_public_mail_region(token, result)}
     </main>
     """
     return public_shell(f"{email_address} - 邮件查看", body, wide=True)
@@ -455,31 +468,30 @@ def formatTimeForHtml(timestamp: Any) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(timestamp)))
 
 
-def get_public_mail_result(account: dict[str, Any]) -> dict[str, Any]:
+def get_public_mail_result(account: dict[str, Any], page: int = 1) -> dict[str, Any]:
     owner_id = int(account["owner_id"])
     if account["target_id"]:
-        target_id = int(account["target_id"])
-        first_page = store.list_target_archived_messages(
-            owner_id,
-            target_id,
-            1,
-            1,
-        )
-        return store.list_target_archived_messages(
-            owner_id,
-            target_id,
-            1,
-            max(int(first_page["total"]), 1),
-        )
-
-    account_id = int(account["id"])
-    first_page = store.list_archived_messages(owner_id, account_id, 1, 1)
-    return store.list_archived_messages(
-        owner_id,
-        account_id,
+        def load_page(current_page: int) -> dict[str, Any]:
+            return store.list_target_archived_messages(
+                owner_id,
+                int(account["target_id"]),
+                current_page,
+                PUBLIC_MAIL_PAGE_SIZE,
+            )
+    else:
+        def load_page(current_page: int) -> dict[str, Any]:
+            return store.list_archived_messages(
+                owner_id,
+                int(account["id"]),
+                current_page,
+                PUBLIC_MAIL_PAGE_SIZE,
+            )
+    result = load_page(page)
+    total_pages = max(
         1,
-        max(int(first_page["total"]), 1),
+        (int(result["total"]) + PUBLIC_MAIL_PAGE_SIZE - 1) // PUBLIC_MAIL_PAGE_SIZE,
     )
+    return load_page(total_pages) if page > total_pages else result
 
 
 @app.get("/admin")
@@ -506,10 +518,14 @@ async def public_captcha(token: str, request: Request) -> Response:
         return Response("not found", status_code=404)
     alphabet = string.ascii_uppercase + string.digits
     answer = "".join(secrets.choice(alphabet) for _ in range(4))
-    request.session[captcha_key(token)] = {
-        "answer": answer.lower(),
-        "created_at": int(time.time()),
-    }
+    challenge_id = secrets.token_urlsafe(24)
+    store.create_captcha_challenge(
+        challenge_id,
+        token,
+        captcha_digest(challenge_id, answer),
+        CAPTCHA_TTL_SECONDS,
+    )
+    request.session[captcha_key(token)] = challenge_id
     return Response(
         captcha_svg(answer),
         media_type="image/svg+xml",
@@ -524,10 +540,17 @@ async def verify_public_mail(token: str, request: Request) -> Response:
 
     body = (await request.body()).decode("utf-8", errors="ignore")
     answer = (parse_qs(body).get("answer") or [""])[0].strip().lower()
-    captcha = request.session.get(captcha_key(token))
-    created_at = int(captcha.get("created_at", 0)) if isinstance(captcha, dict) else 0
-    expected = str(captcha.get("answer", "")) if isinstance(captcha, dict) else ""
-    if not answer or answer != expected or created_at < int(time.time()) - CAPTCHA_TTL_SECONDS:
+    challenge_id = request.session.get(captcha_key(token))
+    verified = bool(
+        answer
+        and isinstance(challenge_id, str)
+        and store.consume_captcha_challenge(
+            challenge_id,
+            token,
+            captcha_digest(challenge_id, answer),
+        )
+    )
+    if not verified:
         return HTMLResponse(
             render_captcha_page(token, "验证码错误或已过期，请重新输入。"),
             status_code=400,
@@ -543,6 +566,7 @@ async def verify_public_mail(token: str, request: Request) -> Response:
 async def public_mail_view(
     token: str,
     request: Request,
+    page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     if not TOKEN_PATTERN.match(token) or not is_public_host(request):
         return public_not_found()
@@ -557,23 +581,7 @@ async def public_mail_view(
             headers={"Cache-Control": "no-store"},
         )
 
-    if "refresh" in request.query_params:
-        try:
-            await mail_archive_coordinator.sync_account(int(account["id"]))
-        except TokenRefreshError as exc:
-            return HTMLResponse(
-                public_error_page("暂时无法读取邮件", exc.description),
-                status_code=502,
-                headers={"Cache-Control": "no-store"},
-            )
-        except MailboxError as exc:
-            return HTMLResponse(
-                public_error_page("暂时无法读取邮件", str(exc)),
-                status_code=502,
-                headers={"Cache-Control": "no-store"},
-            )
-
-    result = get_public_mail_result(account)
+    result = get_public_mail_result(account, page)
     store.mark_share_access(token)
     return HTMLResponse(
         render_public_mail_page(token, account["shared_email"], result),
@@ -582,7 +590,11 @@ async def public_mail_view(
 
 
 @app.post("/{token}/refresh")
-async def refresh_public_mail(token: str, request: Request) -> JSONResponse:
+async def refresh_public_mail(
+    token: str,
+    request: Request,
+    page: int = Query(default=1, ge=1),
+) -> JSONResponse:
     if not TOKEN_PATTERN.match(token) or not is_public_host(request):
         return JSONResponse({"detail": "链接不存在或已失效。"}, status_code=404)
 
@@ -592,18 +604,46 @@ async def refresh_public_mail(token: str, request: Request) -> JSONResponse:
     if not is_verified(request, token):
         return JSONResponse({"detail": "请先完成验证码验证。"}, status_code=403)
 
-    try:
-        await mail_archive_coordinator.sync_account(int(account["id"]))
-    except TokenRefreshError as exc:
-        return JSONResponse({"detail": exc.description}, status_code=502)
-    except MailboxError as exc:
-        return JSONResponse({"detail": str(exc)}, status_code=502)
-
-    store.mark_share_access(token)
+    job = full_refresh_coordinator.start_job(
+        int(account["owner_id"]),
+        [int(account["id"])],
+        mode="mail",
+        public_token=token,
+    )
     return JSONResponse(
-        {"html": render_public_mail_list(get_public_mail_result(account))},
+        {
+            **job,
+            "status_url": f"/{token}/refresh/{job['id']}?page={page}",
+        },
+        status_code=202,
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.get("/{token}/refresh/{job_id}")
+async def get_public_refresh_job(
+    token: str,
+    job_id: str,
+    request: Request,
+    page: int = Query(default=1, ge=1),
+) -> JSONResponse:
+    if not TOKEN_PATTERN.match(token) or not is_public_host(request):
+        return JSONResponse({"detail": "链接不存在或已失效。"}, status_code=404)
+    account = store.get_shared_mailbox(token)
+    if not account:
+        return JSONResponse({"detail": "链接不存在或已失效。"}, status_code=404)
+    if not is_verified(request, token):
+        return JSONResponse({"detail": "请先完成验证码验证。"}, status_code=403)
+    job = full_refresh_coordinator.get_public_job(token, job_id)
+    if not job:
+        return JSONResponse({"detail": "刷新任务不存在。"}, status_code=404)
+    if job["done"] and not job["failed"]:
+        store.mark_share_access(token)
+        job["html"] = render_public_mail_region(
+            token,
+            get_public_mail_result(account, page),
+        )
+    return JSONResponse(job, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/session")
@@ -744,7 +784,7 @@ async def complete_oauth_device_authorization(
 async def dashboard(user: CurrentUser) -> dict[str, object]:
     return {
         "accounts": store.dashboard_stats(int(user["id"])),
-        "service": refresh_coordinator.status(),
+        "service": full_refresh_coordinator.status(),
     }
 
 
@@ -774,13 +814,14 @@ async def import_accounts(
     user: CurrentUser,
 ) -> dict[str, int]:
     result = store.import_accounts(int(user["id"]), parse_import(payload.content))
-    queued = await refresh_coordinator.enqueue(
-        store.refreshable_ids(int(user["id"]), result["account_ids"])
+    job = full_refresh_coordinator.start_job(
+        int(user["id"]),
+        store.refreshable_ids(int(user["id"]), result["account_ids"]),
     )
     return {
         "imported": int(result["imported"]),
         "updated": int(result["updated"]),
-        "queued": queued,
+        "queued": int(job["total"]),
     }
 
 
@@ -976,7 +1017,6 @@ async def list_messages(account_id: int, user: CurrentUser) -> dict[str, object]
     if not account:
         raise HTTPException(status_code=404, detail="邮箱不存在")
 
-    last_mail_at = account["last_mail_at"]
     result = store.list_archived_messages(
         int(user["id"]),
         account_id,
@@ -984,25 +1024,9 @@ async def list_messages(account_id: int, user: CurrentUser) -> dict[str, object]
         int(store.get_settings()["mail_page_size"]),
     )
 
-    # 首次归档尚未完成时，沿用原有的打开收件箱即读取行为，避免迁移后显示为空。
-    if not result["items"] and account["last_archive_sync_at"] is None:
-        try:
-            sync_result = await mail_archive_coordinator.sync_account(account_id)
-        except TokenRefreshError as exc:
-            raise HTTPException(status_code=502, detail=exc.description) from exc
-        except MailboxError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        result = store.list_archived_messages(
-            int(user["id"]),
-            account_id,
-            1,
-            int(store.get_settings()["mail_page_size"]),
-        )
-        last_mail_at = sync_result["last_mail_at"]
-
     return {
         "email": account["email"],
-        "last_mail_at": last_mail_at,
+        "last_mail_at": account["last_mail_at"],
         **result,
     }
 
@@ -1012,20 +1036,11 @@ async def sync_messages(account_id: int, user: CurrentUser) -> dict[str, object]
     account = store.get_account(account_id, int(user["id"]))
     if not account:
         raise HTTPException(status_code=404, detail="邮箱不存在")
-    try:
-        sync_result = await mail_archive_coordinator.sync_account(account_id)
-    except TokenRefreshError as exc:
-        raise HTTPException(status_code=502, detail=exc.description) from exc
-    except MailboxError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    result = store.list_archived_messages(
+    return full_refresh_coordinator.start_job(
         int(user["id"]),
-        account_id,
-        1,
-        int(store.get_settings()["mail_page_size"]),
+        [account_id],
+        mode="mail",
     )
-    return {"email": account["email"], **sync_result, **result}
 
 
 @app.get("/api/accounts/{account_id}/messages/{uid}")

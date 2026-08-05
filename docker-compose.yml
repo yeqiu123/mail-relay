@@ -25,3 +25,6 @@ services:
       - .env
     volumes:
       - ./data:/data
+    depends_on:
+      mail-relay:
+        condition: service_healthy

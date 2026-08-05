@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -138,16 +136,21 @@ class MicrosoftTokenService:
             self._locks[account_id] = lock
         return lock
 
-    async def refresh_account(self, account_id: int) -> dict[str, Any]:
+    async def refresh_account(
+        self,
+        account_id: int,
+        force: bool = False,
+    ) -> dict[str, Any]:
         async with self._lock_for(account_id):
             account = self.store.get_account(account_id)
             if not account:
                 raise TokenRefreshError("not_found", "邮箱不存在", True)
 
             now = int(time.time())
-            # 刚刷新成功的令牌直接复用，避免手动重复操作触发 Microsoft 请求循环限制。
+            # 自动任务复用新令牌；手动完整校验必须真实验证 refresh token。
             if (
-                account["access_token"]
+                not force
+                and account["access_token"]
                 and account["access_expires_at"]
                 and int(account["access_expires_at"]) > now + 120
                 and account["last_refresh_at"]
@@ -440,13 +443,36 @@ class MailArchiveCoordinator:
                 raise TokenRefreshError("not_found", "邮箱不存在", True)
             try:
                 access_token = await self.token_service.get_access_token(account_id)
-                limit = int(self.store.get_settings()["mail_page_size"])
-                messages = await asyncio.to_thread(
-                    self.mailbox.list_messages,
-                    account["email"],
-                    access_token,
-                    limit,
-                )
+                expected_uid_validity = str(account.get("imap_uid_validity") or "")
+                last_synced_uid = int(account.get("last_synced_uid") or 0)
+                stored = 0
+                while True:
+                    result = await asyncio.to_thread(
+                        self.mailbox.list_messages_after,
+                        account["email"],
+                        access_token,
+                        expected_uid_validity,
+                        last_synced_uid,
+                        100,
+                    )
+                    uid_validity = str(result["uid_validity"])
+                    if result["reset"]:
+                        self.store.reset_mail_archive_cursor(account_id, uid_validity)
+                        expected_uid_validity = uid_validity
+                        last_synced_uid = 0
+                    messages = result["items"]
+                    stored += self.store.archive_mail_messages(
+                        int(account["owner_id"]), account_id, messages
+                    )
+                    last_synced_uid = int(result["last_uid"])
+                    self.store.update_mail_archive_cursor(
+                        account_id,
+                        uid_validity,
+                        last_synced_uid,
+                    )
+                    expected_uid_validity = uid_validity
+                    if not result["has_more"]:
+                        break
             except TokenRefreshError:
                 raise
             except MailboxError as exc:
@@ -456,9 +482,6 @@ class MailArchiveCoordinator:
                 raise
 
             synced_at = int(time.time())
-            stored = self.store.archive_mail_messages(
-                int(account["owner_id"]), account_id, messages
-            )
             self.store.mark_mail_archive_synced(account_id, synced_at)
             return {"stored": stored, "last_mail_at": synced_at}
 
@@ -493,59 +516,26 @@ class MailArchiveCoordinator:
         }
 
 
-@dataclass
-class FullRefreshJob:
-    """单次手动完整校验的进度与结果。"""
-
-    id: str
-    owner_id: int
-    total: int
-    completed: int = 0
-    succeeded: int = 0
-    failed: int = 0
-
-    @property
-    def done(self) -> bool:
-        return self.completed >= self.total
-
-    def response(self) -> dict[str, str | int | bool]:
-        return {
-            "id": self.id,
-            "total": self.total,
-            "completed": self.completed,
-            "succeeded": self.succeeded,
-            "failed": self.failed,
-            "done": self.done,
-        }
-
-
 class FullRefreshCoordinator:
-    """手动完整校验队列：刷新令牌后必须成功读取收件箱。"""
+    """数据库刷新队列：Web 只建任务，worker 独占令牌与 IMAP 操作。"""
 
     def __init__(
         self,
         store: Store,
-        token_service: MicrosoftTokenService,
-        mail_archive_coordinator: MailArchiveCoordinator,
-        worker_count: int,
+        token_service: MicrosoftTokenService | None = None,
+        mail_archive_coordinator: MailArchiveCoordinator | None = None,
+        worker_count: int = 1,
     ) -> None:
         self.store = store
         self.token_service = token_service
         self.mail_archive_coordinator = mail_archive_coordinator
         self.worker_count = worker_count
-        self.queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
-        self._jobs: dict[str, FullRefreshJob] = {}
-        self._account_locks: dict[int, asyncio.Lock] = {}
         self._tasks: list[asyncio.Task[Any]] = []
 
-    def _lock_for(self, account_id: int) -> asyncio.Lock:
-        lock = self._account_locks.get(account_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._account_locks[account_id] = lock
-        return lock
-
     async def start(self) -> None:
+        if not self.token_service or not self.mail_archive_coordinator:
+            return
+        self.store.requeue_running_refresh_items()
         self._tasks = [
             asyncio.create_task(
                 self._worker(index), name=f"full-refresh-worker-{index}"
@@ -564,67 +554,89 @@ class FullRefreshCoordinator:
         self,
         owner_id: int,
         account_ids: list[int],
-    ) -> dict[str, str | int | bool]:
-        job = FullRefreshJob(
-            id=uuid.uuid4().hex,
-            owner_id=owner_id,
-            total=len(account_ids),
+        mode: str = "full",
+        public_token: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.create_refresh_job(
+            owner_id,
+            account_ids,
+            mode,
+            public_token,
         )
-        self._jobs[job.id] = job
-        if account_ids:
-            self.store.mark_full_refresh_pending(account_ids)
-            for account_id in account_ids:
-                self.queue.put_nowait((job.id, account_id))
-        return job.response()
 
     def get_job(
         self,
         owner_id: int,
         job_id: str,
-    ) -> dict[str, str | int | bool] | None:
-        job = self._jobs.get(job_id)
-        if not job or job.owner_id != owner_id:
-            return None
-        return job.response()
+    ) -> dict[str, Any] | None:
+        return self.store.get_refresh_job(owner_id, job_id)
+
+    def get_public_job(self, token: str, job_id: str) -> dict[str, Any] | None:
+        return self.store.get_public_refresh_job(token, job_id)
+
+    async def _renew_lease(self, item_id: int) -> None:
+        while True:
+            await asyncio.sleep(60)
+            self.store.renew_refresh_job_item(item_id)
 
     async def _worker(self, index: int) -> None:
         del index
         while True:
-            job_id, account_id = await self.queue.get()
-            job = self._jobs.get(job_id)
+            item = self.store.claim_refresh_job_item()
+            if not item:
+                await asyncio.sleep(0.5)
+                continue
+            account_id = item["account_id"]
+            mode = str(item["mode"])
             succeeded = False
+            error = ""
+            cancelled = False
+            heartbeat = asyncio.create_task(
+                self._renew_lease(int(item["id"])),
+                name=f"refresh-job-lease-{item['id']}",
+            )
             try:
-                if not job:
-                    continue
-                async with self._lock_for(account_id):
-                    await self.token_service.refresh_account(account_id)
-                    await self.mail_archive_coordinator.sync_account(account_id)
+                if account_id is None:
+                    raise TokenRefreshError("not_found", "邮箱不存在", True)
+                if mode == "full":
+                    await self.token_service.refresh_account(int(account_id), force=True)
+                await self.mail_archive_coordinator.sync_account(int(account_id))
+                if mode == "full":
                     self.store.mark_full_refresh_succeeded(account_id)
-                    succeeded = True
+                succeeded = True
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
             except TokenRefreshError as exc:
-                self.store.mark_full_refresh_failure(account_id, exc.description)
+                error = exc.description
+                if mode == "full" and account_id is not None:
+                    self.store.mark_full_refresh_failure(
+                        int(account_id),
+                        exc.description,
+                        permanent=exc.permanent,
+                    )
             except MailboxError as exc:
-                self.store.mark_full_refresh_failure(
-                    account_id,
-                    str(exc),
-                    mail_error=True,
-                )
+                error = str(exc)
+                if mode == "full" and account_id is not None:
+                    self.store.mark_full_refresh_failure(
+                        int(account_id),
+                        str(exc),
+                        mail_error=True,
+                    )
             except Exception as exc:
-                self.store.mark_full_refresh_failure(
-                    account_id,
-                    f"internal_error: {exc.__class__.__name__}",
-                )
+                error = f"internal_error: {exc.__class__.__name__}"
+                if mode == "full" and account_id is not None:
+                    self.store.mark_full_refresh_failure(int(account_id), error)
             finally:
-                if job:
-                    job.completed += 1
-                    if succeeded:
-                        job.succeeded += 1
-                    else:
-                        job.failed += 1
-                self.queue.task_done()
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                if not cancelled:
+                    self.store.complete_refresh_job_item(
+                        int(item["id"]),
+                        succeeded,
+                        error,
+                    )
 
     def status(self) -> dict[str, int]:
-        return {
-            "queued": self.queue.qsize(),
-            "workers": self.worker_count,
-        }
+        status = self.store.refresh_job_status()
+        return {**status, "workers": self.worker_count}

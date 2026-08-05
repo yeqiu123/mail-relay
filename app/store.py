@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hmac
 import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .security import Vault, hash_password, verify_password
 
@@ -23,13 +25,18 @@ class Store:
         self.vault = vault
         self._write_lock = threading.RLock()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 30000")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     @staticmethod
     def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -77,6 +84,8 @@ class Store:
                 next_refresh_at       INTEGER,
                 last_mail_at          INTEGER,
                 last_archive_sync_at  INTEGER,
+                imap_uid_validity     TEXT,
+                last_synced_uid       INTEGER,
                 last_error            TEXT,
                 last_mail_error       TEXT,
                 created_at            INTEGER NOT NULL,
@@ -265,6 +274,56 @@ class Store:
         )
 
     @staticmethod
+    def _create_captcha_challenges_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS captcha_challenges (
+                id             TEXT PRIMARY KEY,
+                share_token    TEXT NOT NULL,
+                answer_digest  TEXT NOT NULL,
+                attempts       INTEGER NOT NULL DEFAULT 0,
+                expires_at     INTEGER NOT NULL,
+                created_at     INTEGER NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_refresh_jobs_tables(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_jobs (
+                id             TEXT PRIMARY KEY,
+                owner_id       INTEGER NOT NULL,
+                mode           TEXT NOT NULL,
+                public_token   TEXT,
+                status         TEXT NOT NULL DEFAULT 'queued',
+                total          INTEGER NOT NULL DEFAULT 0,
+                completed      INTEGER NOT NULL DEFAULT 0,
+                succeeded      INTEGER NOT NULL DEFAULT 0,
+                failed         INTEGER NOT NULL DEFAULT 0,
+                created_at     INTEGER NOT NULL,
+                updated_at     INTEGER NOT NULL,
+                completed_at   INTEGER,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS refresh_job_items (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id         TEXT NOT NULL,
+                account_id     INTEGER,
+                status         TEXT NOT NULL DEFAULT 'queued',
+                error          TEXT,
+                claimed_at     INTEGER,
+                completed_at   INTEGER,
+                FOREIGN KEY(job_id) REFERENCES refresh_jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL,
+                UNIQUE(job_id, account_id)
+            );
+            """
+        )
+
+    @staticmethod
     def _ensure_share_link_columns(connection: sqlite3.Connection) -> None:
         for table in ("share_links", "target_share_links"):
             columns = Store._columns(connection, table)
@@ -420,6 +479,14 @@ class Store:
                     connection.execute(
                         "ALTER TABLE accounts ADD COLUMN last_archive_sync_at INTEGER"
                     )
+                if "imap_uid_validity" not in account_columns:
+                    connection.execute(
+                        "ALTER TABLE accounts ADD COLUMN imap_uid_validity TEXT"
+                    )
+                if "last_synced_uid" not in account_columns:
+                    connection.execute(
+                        "ALTER TABLE accounts ADD COLUMN last_synced_uid INTEGER"
+                    )
                 if "last_mail_error" not in account_columns:
                     connection.execute(
                         "ALTER TABLE accounts ADD COLUMN last_mail_error TEXT"
@@ -484,6 +551,8 @@ class Store:
             self._create_mail_tags_table(connection)
             self._create_mail_target_tags_table(connection)
             self._create_oauth_device_flows_table(connection)
+            self._create_captcha_challenges_table(connection)
+            self._create_refresh_jobs_tables(connection)
             self._ensure_share_link_columns(connection)
             connection.executescript(
                 """
@@ -515,6 +584,32 @@ class Store:
                     ON mail_target_tags(tag_id, target_id);
                 CREATE INDEX IF NOT EXISTS idx_oauth_device_flows_owner
                     ON oauth_device_flows(owner_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_captcha_challenges_expiry
+                    ON captcha_challenges(expires_at);
+                CREATE INDEX IF NOT EXISTS idx_refresh_jobs_owner_created
+                    ON refresh_jobs(owner_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_refresh_jobs_public_token
+                    ON refresh_jobs(public_token, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_refresh_job_items_status
+                    ON refresh_job_items(status, id);
+                CREATE INDEX IF NOT EXISTS idx_refresh_job_items_account
+                    ON refresh_job_items(account_id, status);
+                """
+            )
+            # 旧内存任务在升级时已经丢失，清理无法继续执行的遗留状态。
+            connection.execute(
+                """
+                UPDATE accounts
+                SET full_refresh_pending = 0
+                WHERE full_refresh_pending = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM refresh_job_items
+                      JOIN refresh_jobs ON refresh_jobs.id = refresh_job_items.job_id
+                      WHERE refresh_job_items.account_id = accounts.id
+                        AND refresh_jobs.mode = 'full'
+                        AND refresh_job_items.status IN ('queued', 'running')
+                  )
                 """
             )
             connection.executemany(
@@ -1040,6 +1135,38 @@ class Store:
                 (value, value, int(time.time()), account_id),
             )
 
+    def reset_mail_archive_cursor(self, account_id: int, uid_validity: str) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM mail_messages WHERE account_id = ?",
+                (account_id,),
+            )
+            connection.execute(
+                """
+                UPDATE accounts
+                SET imap_uid_validity = ?, last_synced_uid = 0,
+                    last_archive_sync_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (uid_validity, int(time.time()), account_id),
+            )
+
+    def update_mail_archive_cursor(
+        self,
+        account_id: int,
+        uid_validity: str,
+        last_synced_uid: int,
+    ) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE accounts
+                SET imap_uid_validity = ?, last_synced_uid = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (uid_validity, last_synced_uid, int(time.time()), account_id),
+            )
+
     def list_mail_targets(self, owner_id: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1515,6 +1642,7 @@ class Store:
                 FROM target_share_links
                 JOIN mail_targets ON mail_targets.id = target_share_links.target_id
                 JOIN accounts ON accounts.id = mail_targets.account_id
+                JOIN users ON users.id = accounts.owner_id AND users.enabled = 1
                 WHERE target_share_links.token = ?
                   AND mail_targets.enabled = 1
                   AND target_share_links.revoked_at IS NULL
@@ -1536,6 +1664,7 @@ class Store:
                         NULL AS target_email
                     FROM share_links
                     JOIN accounts ON accounts.id = share_links.account_id
+                    JOIN users ON users.id = accounts.owner_id AND users.enabled = 1
                     WHERE share_links.token = ?
                       AND share_links.revoked_at IS NULL
                       AND (
@@ -1619,6 +1748,365 @@ class Store:
                 (now, now, owner_id, token),
             )
         return cursor.rowcount > 0
+
+    def create_captcha_challenge(
+        self,
+        challenge_id: str,
+        share_token: str,
+        answer_digest: str,
+        ttl_seconds: int,
+    ) -> None:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM captcha_challenges WHERE expires_at <= ?",
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO captcha_challenges(
+                    id, share_token, answer_digest, attempts, expires_at, created_at
+                ) VALUES (?, ?, ?, 0, ?, ?)
+                """,
+                (challenge_id, share_token, answer_digest, now + ttl_seconds, now),
+            )
+
+    def consume_captcha_challenge(
+        self,
+        challenge_id: str,
+        share_token: str,
+        answer_digest: str,
+        max_attempts: int = 5,
+    ) -> bool:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM captcha_challenges
+                WHERE id = ? AND share_token = ?
+                """,
+                (challenge_id, share_token),
+            ).fetchone()
+            if not row or int(row["expires_at"]) <= now or int(row["attempts"]) >= max_attempts:
+                connection.execute(
+                    "DELETE FROM captcha_challenges WHERE id = ?",
+                    (challenge_id,),
+                )
+                return False
+            if hmac.compare_digest(str(row["answer_digest"]), answer_digest):
+                connection.execute(
+                    "DELETE FROM captcha_challenges WHERE id = ?",
+                    (challenge_id,),
+                )
+                return True
+            connection.execute(
+                """
+                UPDATE captcha_challenges
+                SET attempts = attempts + 1
+                WHERE id = ?
+                """,
+                (challenge_id,),
+            )
+            return False
+
+    @staticmethod
+    def _refresh_job_response(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        error_row = connection.execute(
+            """
+            SELECT error FROM refresh_job_items
+            WHERE job_id = ? AND error IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        return {
+            "id": row["id"],
+            "mode": row["mode"],
+            "total": int(row["total"]),
+            "completed": int(row["completed"]),
+            "succeeded": int(row["succeeded"]),
+            "failed": int(row["failed"]),
+            "done": row["status"] == "completed",
+            "error": str(error_row["error"]) if error_row else "",
+        }
+
+    def create_refresh_job(
+        self,
+        owner_id: int,
+        account_ids: Iterable[int],
+        mode: str,
+        public_token: str | None = None,
+    ) -> dict[str, Any]:
+        ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM refresh_jobs WHERE completed_at IS NOT NULL AND completed_at < ?",
+                (now - 7 * 86400,),
+            )
+            if mode == "mail" and len(ids) == 1:
+                existing = connection.execute(
+                    """
+                    SELECT refresh_jobs.*
+                    FROM refresh_jobs
+                    JOIN refresh_job_items
+                        ON refresh_job_items.job_id = refresh_jobs.id
+                    WHERE refresh_jobs.owner_id = ?
+                      AND refresh_jobs.mode = 'mail'
+                      AND refresh_jobs.public_token IS ?
+                      AND refresh_jobs.status IN ('queued', 'running')
+                      AND refresh_job_items.account_id = ?
+                      AND refresh_job_items.status IN ('queued', 'running')
+                    ORDER BY refresh_jobs.created_at DESC LIMIT 1
+                    """,
+                    (owner_id, public_token, ids[0]),
+                ).fetchone()
+                if existing:
+                    return self._refresh_job_response(connection, existing)
+
+            job_id = uuid.uuid4().hex
+            status = "completed" if not ids else "queued"
+            completed_at = now if not ids else None
+            connection.execute(
+                """
+                INSERT INTO refresh_jobs(
+                    id, owner_id, mode, public_token, status, total,
+                    completed, succeeded, failed, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    owner_id,
+                    mode,
+                    public_token,
+                    status,
+                    len(ids),
+                    now,
+                    now,
+                    completed_at,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO refresh_job_items(job_id, account_id, status)
+                VALUES (?, ?, 'queued')
+                """,
+                [(job_id, account_id) for account_id in ids],
+            )
+            if mode == "full" and ids:
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"""
+                    UPDATE accounts
+                    SET full_refresh_pending = 1, last_error = NULL,
+                        last_mail_error = NULL, updated_at = ?
+                    WHERE owner_id = ? AND id IN ({placeholders})
+                    """,
+                    [now, owner_id, *ids],
+                )
+            row = connection.execute(
+                "SELECT * FROM refresh_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return self._refresh_job_response(connection, row)
+
+    def get_refresh_job(self, owner_id: int, job_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM refresh_jobs WHERE id = ? AND owner_id = ?",
+                (job_id, owner_id),
+            ).fetchone()
+            return self._refresh_job_response(connection, row) if row else None
+
+    def get_public_refresh_job(
+        self,
+        public_token: str,
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM refresh_jobs
+                WHERE id = ? AND public_token = ? AND mode = 'mail'
+                """,
+                (job_id, public_token),
+            ).fetchone()
+            return self._refresh_job_response(connection, row) if row else None
+
+    def requeue_running_refresh_items(self) -> None:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE refresh_job_items
+                SET status = 'queued', claimed_at = NULL
+                WHERE status = 'running'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE refresh_jobs
+                SET status = 'queued', updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+
+    def claim_refresh_job_item(self, lease_seconds: int = 600) -> dict[str, Any] | None:
+        now = int(time.time())
+        with self._connect() as connection:
+            pending = connection.execute(
+                """
+                SELECT 1 FROM refresh_job_items
+                JOIN refresh_jobs ON refresh_jobs.id = refresh_job_items.job_id
+                WHERE refresh_jobs.status IN ('queued', 'running')
+                  AND (
+                      refresh_job_items.status = 'queued'
+                      OR (
+                          refresh_job_items.status = 'running'
+                          AND refresh_job_items.claimed_at < ?
+                      )
+                  )
+                LIMIT 1
+                """,
+                (now - lease_seconds,),
+            ).fetchone()
+        if not pending:
+            return None
+        with self._write_lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE refresh_job_items
+                SET status = 'queued', claimed_at = NULL
+                WHERE status = 'running' AND claimed_at < ?
+                """,
+                (now - lease_seconds,),
+            )
+            row = connection.execute(
+                """
+                SELECT
+                    refresh_job_items.id,
+                    refresh_job_items.job_id,
+                    refresh_job_items.account_id,
+                    refresh_jobs.owner_id,
+                    refresh_jobs.mode
+                FROM refresh_job_items
+                JOIN refresh_jobs ON refresh_jobs.id = refresh_job_items.job_id
+                WHERE refresh_job_items.status = 'queued'
+                  AND refresh_jobs.status IN ('queued', 'running')
+                  AND (
+                      refresh_job_items.account_id IS NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM refresh_job_items AS running_item
+                          WHERE running_item.account_id = refresh_job_items.account_id
+                            AND running_item.status = 'running'
+                      )
+                  )
+                ORDER BY refresh_job_items.id
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            cursor = connection.execute(
+                """
+                UPDATE refresh_job_items
+                SET status = 'running', claimed_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (now, int(row["id"])),
+            )
+            if cursor.rowcount == 0:
+                return None
+            connection.execute(
+                """
+                UPDATE refresh_jobs
+                SET status = 'running', updated_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (now, row["job_id"]),
+            )
+            return dict(row)
+
+    def complete_refresh_job_item(
+        self,
+        item_id: int,
+        succeeded: bool,
+        error: str = "",
+    ) -> None:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            item = connection.execute(
+                "SELECT job_id FROM refresh_job_items WHERE id = ? AND status = 'running'",
+                (item_id,),
+            ).fetchone()
+            if not item:
+                return
+            connection.execute(
+                """
+                UPDATE refresh_job_items
+                SET status = ?, error = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                ("succeeded" if succeeded else "failed", error[:600] or None, now, item_id),
+            )
+            job = connection.execute(
+                "SELECT completed, total FROM refresh_jobs WHERE id = ?",
+                (item["job_id"],),
+            ).fetchone()
+            completed = int(job["completed"]) + 1
+            done = completed >= int(job["total"])
+            connection.execute(
+                """
+                UPDATE refresh_jobs
+                SET completed = ?,
+                    succeeded = succeeded + ?,
+                    failed = failed + ?,
+                    status = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    completed,
+                    1 if succeeded else 0,
+                    0 if succeeded else 1,
+                    "completed" if done else "running",
+                    now,
+                    now if done else None,
+                    item["job_id"],
+                ),
+            )
+
+    def renew_refresh_job_item(self, item_id: int) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE refresh_job_items
+                SET claimed_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (int(time.time()), item_id),
+            )
+
+    def refresh_job_status(self) -> dict[str, int]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued,
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running
+                FROM refresh_job_items
+                """
+            ).fetchone()
+        return {
+            "queued": int(row["queued"] or 0),
+            "running": int(row["running"] or 0),
+        }
 
     def existing_ids(
         self,
@@ -1715,17 +2203,19 @@ class Store:
         account_id: int,
         message: str,
         mail_error: bool = False,
+        permanent: bool = False,
     ) -> None:
         with self._write_lock, self._connect() as connection:
             connection.execute(
                 """
                 UPDATE accounts
-                SET status = 'error', full_refresh_pending = 0,
+                SET status = ?, full_refresh_pending = 0,
                     last_error = ?,
                     last_mail_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
+                    "invalid" if permanent else "error",
                     message[:600],
                     message[:600] if mail_error else None,
                     int(time.time()),

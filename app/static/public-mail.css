@@ -247,13 +247,17 @@ h2 {
   white-space: nowrap;
 }
 
+.mail-region,
 .mail-list {
   display: grid;
   gap: 12px;
+}
+
+.mail-list {
   transition: opacity var(--transition);
 }
 
-.mail-list[aria-busy="true"] {
+.mail-region[aria-busy="true"] {
   opacity: 0.56;
   pointer-events: none;
 }
@@ -311,6 +315,16 @@ h2 {
   display: flex;
   justify-content: center;
   gap: 10px;
+}
+
+.pager-status {
+  min-width: 70px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
 }
 
 .btn {
