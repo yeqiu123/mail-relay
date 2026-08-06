@@ -533,6 +533,8 @@ class MailArchiveCoordinator:
 class FullRefreshCoordinator:
     """数据库刷新队列：Web 只建任务，worker 独占令牌与 IMAP 操作。"""
 
+    TRANSIENT_RETRY_DELAYS = (2, 5)
+
     def __init__(
         self,
         store: Store,
@@ -593,6 +595,27 @@ class FullRefreshCoordinator:
             await asyncio.sleep(60)
             self.store.renew_refresh_job_item(item_id)
 
+    async def _sync_account(self, account_id: int) -> dict[str, int]:
+        retry_delays = iter(self.TRANSIENT_RETRY_DELAYS)
+        while True:
+            try:
+                return await self.mail_archive_coordinator.sync_account(account_id)
+            except TokenRefreshError as exc:
+                if exc.permanent:
+                    raise
+                retry_error: TokenRefreshError | MailboxError = exc
+            except MailboxError as exc:
+                if exc.authentication_failed:
+                    raise
+                retry_error = exc
+
+            try:
+                delay = next(retry_delays)
+            except StopIteration:
+                raise retry_error
+            # 微软偶发请求循环或 IMAP 会话未就绪时，短暂等待后重新验证收件箱。
+            await asyncio.sleep(delay)
+
     async def _worker(self, index: int) -> None:
         del index
         while True:
@@ -612,9 +635,8 @@ class FullRefreshCoordinator:
             try:
                 if account_id is None:
                     raise TokenRefreshError("not_found", "邮箱不存在", True)
-                if mode == "full":
-                    await self.token_service.refresh_account(int(account_id), force=True)
-                await self.mail_archive_coordinator.sync_account(int(account_id))
+                # 收件箱同步会按需刷新即将过期的令牌，避免批量强制轮换触发 AADSTS50196。
+                await self._sync_account(int(account_id))
                 if mode == "full":
                     self.store.mark_full_refresh_succeeded(account_id)
                 succeeded = True
