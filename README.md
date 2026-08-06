@@ -22,7 +22,9 @@ The public share domain is configured with `PUBLIC_SHARE_ORIGIN`. The main manag
 
 Shared links can be configured with an expiry period or revoked immediately. Expired and revoked tokens no longer expose mailbox content.
 
-Responses include a restrictive content security policy and standard browser security headers.
+Responses include a restrictive content security policy and standard browser security headers. Browser icons are served locally so the management page does not execute third-party CDN scripts. The container applies a private file-creation mask to the database and backup files.
+
+The provided Nginx configurations rate-limit login attempts, CAPTCHA generation, verification attempts, and public refresh requests. Public mailbox refreshes also have a server-side 30-second cooldown.
 
 ## Microsoft Device Authorization
 
@@ -38,4 +40,4 @@ New accounts created through device authorization export an empty password field
 2. Run `docker compose up -d --build`.
 3. The container listens on `127.0.0.1:8765`; place Nginx or another HTTPS reverse proxy in front of it.
 
-Docker Compose starts a web container and a separate task worker. The browser does not poll the mailbox list automatically. The worker exclusively rotates tokens, processes durable manual refresh jobs, and synchronizes all unseen IMAP UIDs every `MAIL_SYNC_INTERVAL_SECONDS` (five minutes by default). Shared links read the local archive in newest-first pages. Token rotation defaults to seven days. A refresh token can still be invalidated by revoked consent, password changes, account protection, or Microsoft policy.
+Docker Compose starts a web container and a separate task worker. The browser does not poll the mailbox list automatically. The worker exclusively rotates tokens, processes durable manual refresh jobs, and synchronizes all unseen IMAP UIDs every `MAIL_SYNC_INTERVAL_SECONDS` (five minutes by default). Each mailbox sync uses one IMAP session and writes bounded batches. If IMAP UIDVALIDITY changes, a complete replacement snapshot is staged before the existing archive is atomically replaced. Shared links read the local archive in newest-first pages. Token rotation defaults to seven days. A refresh token can still be invalidated by revoked consent, password changes, account protection, or Microsoft policy.

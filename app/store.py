@@ -178,6 +178,46 @@ class Store:
         )
 
     @staticmethod
+    def _create_mail_sync_staging_tables(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mail_sync_state (
+                account_id       INTEGER PRIMARY KEY,
+                uid_validity     TEXT NOT NULL,
+                last_synced_uid  INTEGER NOT NULL DEFAULT 0,
+                started_at       INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_sync_messages (
+                account_id      INTEGER NOT NULL,
+                uid             TEXT NOT NULL,
+                message_id      TEXT,
+                subject         TEXT NOT NULL,
+                sender_name     TEXT,
+                sender_address  TEXT,
+                received_at     INTEGER,
+                body            TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                PRIMARY KEY(account_id, uid),
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_sync_recipients (
+                account_id      INTEGER NOT NULL,
+                uid             TEXT NOT NULL,
+                email           TEXT NOT NULL COLLATE NOCASE,
+                recipient_type  TEXT NOT NULL,
+                PRIMARY KEY(account_id, uid, email, recipient_type),
+                FOREIGN KEY(account_id, uid)
+                    REFERENCES mail_sync_messages(account_id, uid) ON DELETE CASCADE
+            );
+            """
+        )
+
+    @staticmethod
     def _create_mail_targets_table(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
@@ -546,6 +586,7 @@ class Store:
             self._create_share_links_table(connection)
             self._create_mail_messages_table(connection)
             self._create_mail_recipients_table(connection)
+            self._create_mail_sync_staging_tables(connection)
             self._create_mail_targets_table(connection)
             self._create_target_share_links_table(connection)
             self._create_mail_tags_table(connection)
@@ -574,6 +615,10 @@ class Store:
                     ON mail_messages(owner_id, account_id);
                 CREATE INDEX IF NOT EXISTS idx_mail_recipients_email
                     ON mail_recipients(email, mail_message_id);
+                CREATE INDEX IF NOT EXISTS idx_mail_sync_state_updated
+                    ON mail_sync_state(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_mail_sync_recipients_email
+                    ON mail_sync_recipients(email, account_id, uid);
                 CREATE INDEX IF NOT EXISTS idx_mail_targets_owner_account
                     ON mail_targets(owner_id, account_id);
                 CREATE INDEX IF NOT EXISTS idx_target_share_links_token
@@ -983,6 +1028,7 @@ class Store:
         owner_id: int,
         account_id: int,
         messages: Iterable[dict[str, Any]],
+        staging: bool = False,
     ) -> int:
         now = int(time.time())
         count = 0
@@ -991,54 +1037,85 @@ class Store:
                 uid = str(message.get("uid") or "").strip()
                 if not uid:
                     continue
-                connection.execute(
-                    """
-                    INSERT INTO mail_messages(
-                        owner_id, account_id, uid, message_id, subject,
-                        sender_name, sender_address, received_at, body,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(account_id, uid) DO UPDATE SET
-                        owner_id = excluded.owner_id,
-                        message_id = excluded.message_id,
-                        subject = excluded.subject,
-                        sender_name = excluded.sender_name,
-                        sender_address = excluded.sender_address,
-                        received_at = excluded.received_at,
-                        body = excluded.body,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        owner_id,
-                        account_id,
-                        uid,
-                        str(message.get("message_id") or ""),
-                        str(message.get("subject") or "无主题"),
-                        str(message.get("sender_name") or ""),
-                        str(message.get("sender_address") or ""),
-                        message.get("received_at"),
-                        str(message.get("body") or ""),
-                        now,
-                        now,
-                    ),
+                values = (
+                    str(message.get("message_id") or ""),
+                    str(message.get("subject") or "无主题"),
+                    str(message.get("sender_name") or ""),
+                    str(message.get("sender_address") or ""),
+                    message.get("received_at"),
+                    str(message.get("body") or ""),
+                    now,
+                    now,
                 )
-                message_row = connection.execute(
-                    "SELECT id FROM mail_messages WHERE account_id = ? AND uid = ?",
-                    (account_id, uid),
-                ).fetchone()
-                if message_row:
+                if staging:
+                    connection.execute(
+                        """
+                        INSERT INTO mail_sync_messages(
+                            account_id, uid, message_id, subject, sender_name,
+                            sender_address, received_at, body, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_id, uid) DO UPDATE SET
+                            message_id = excluded.message_id,
+                            subject = excluded.subject,
+                            sender_name = excluded.sender_name,
+                            sender_address = excluded.sender_address,
+                            received_at = excluded.received_at,
+                            body = excluded.body,
+                            updated_at = excluded.updated_at
+                        """,
+                        (account_id, uid, *values),
+                    )
+                    connection.execute(
+                        "DELETE FROM mail_sync_recipients WHERE account_id = ? AND uid = ?",
+                        (account_id, uid),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO mail_messages(
+                            owner_id, account_id, uid, message_id, subject,
+                            sender_name, sender_address, received_at, body,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_id, uid) DO UPDATE SET
+                            owner_id = excluded.owner_id,
+                            message_id = excluded.message_id,
+                            subject = excluded.subject,
+                            sender_name = excluded.sender_name,
+                            sender_address = excluded.sender_address,
+                            received_at = excluded.received_at,
+                            body = excluded.body,
+                            updated_at = excluded.updated_at
+                        """,
+                        (owner_id, account_id, uid, *values),
+                    )
+                    message_row = connection.execute(
+                        "SELECT id FROM mail_messages WHERE account_id = ? AND uid = ?",
+                        (account_id, uid),
+                    ).fetchone()
                     message_id = int(message_row["id"])
                     connection.execute(
                         "DELETE FROM mail_recipients WHERE mail_message_id = ?",
                         (message_id,),
                     )
-                    for recipient in message.get("recipients") or []:
-                        if not isinstance(recipient, dict):
-                            continue
-                        email_address = str(recipient.get("email") or "").strip().lower()
-                        recipient_type = str(recipient.get("recipient_type") or "").strip()
-                        if not email_address or recipient_type not in {"to", "cc"}:
-                            continue
+
+                for recipient in message.get("recipients") or []:
+                    if not isinstance(recipient, dict):
+                        continue
+                    email_address = str(recipient.get("email") or "").strip().lower()
+                    recipient_type = str(recipient.get("recipient_type") or "").strip()
+                    if not email_address or recipient_type not in {"to", "cc"}:
+                        continue
+                    if staging:
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO mail_sync_recipients(
+                                account_id, uid, email, recipient_type
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            (account_id, uid, email_address, recipient_type),
+                        )
+                    else:
                         connection.execute(
                             """
                             INSERT OR IGNORE INTO mail_recipients(
@@ -1110,6 +1187,10 @@ class Store:
                   AND (
                       last_archive_sync_at IS NULL
                       OR last_archive_sync_at <= ?
+                      OR EXISTS (
+                          SELECT 1 FROM mail_sync_state
+                          WHERE mail_sync_state.account_id = accounts.id
+                      )
                   )
                 ORDER BY COALESCE(last_archive_sync_at, 0), id
                 """,
@@ -1135,20 +1216,55 @@ class Store:
                 (value, value, int(time.time()), account_id),
             )
 
-    def reset_mail_archive_cursor(self, account_id: int, uid_validity: str) -> None:
+    def get_mail_archive_cursor(self, account_id: int) -> dict[str, Any]:
+        with self._connect() as connection:
+            staging = connection.execute(
+                """
+                SELECT uid_validity, last_synced_uid
+                FROM mail_sync_state WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            if staging:
+                return {
+                    "uid_validity": str(staging["uid_validity"]),
+                    "last_synced_uid": int(staging["last_synced_uid"]),
+                    "rebuilding": True,
+                }
+            account = connection.execute(
+                """
+                SELECT imap_uid_validity, last_synced_uid
+                FROM accounts WHERE id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+        if not account:
+            raise ValueError("邮箱不存在")
+        return {
+            "uid_validity": str(account["imap_uid_validity"] or ""),
+            "last_synced_uid": int(account["last_synced_uid"] or 0),
+            "rebuilding": False,
+        }
+
+    def begin_mail_archive_rebuild(self, account_id: int, uid_validity: str) -> None:
+        now = int(time.time())
         with self._write_lock, self._connect() as connection:
             connection.execute(
-                "DELETE FROM mail_messages WHERE account_id = ?",
+                "DELETE FROM mail_sync_messages WHERE account_id = ?",
                 (account_id,),
             )
             connection.execute(
                 """
-                UPDATE accounts
-                SET imap_uid_validity = ?, last_synced_uid = 0,
-                    last_archive_sync_at = NULL, updated_at = ?
-                WHERE id = ?
+                INSERT INTO mail_sync_state(
+                    account_id, uid_validity, last_synced_uid, started_at, updated_at
+                ) VALUES (?, ?, 0, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    uid_validity = excluded.uid_validity,
+                    last_synced_uid = 0,
+                    started_at = excluded.started_at,
+                    updated_at = excluded.updated_at
                 """,
-                (uid_validity, int(time.time()), account_id),
+                (account_id, uid_validity, now, now),
             )
 
     def update_mail_archive_cursor(
@@ -1156,15 +1272,108 @@ class Store:
         account_id: int,
         uid_validity: str,
         last_synced_uid: int,
+        rebuilding: bool = False,
     ) -> None:
         with self._write_lock, self._connect() as connection:
+            if rebuilding:
+                connection.execute(
+                    """
+                    UPDATE mail_sync_state
+                    SET last_synced_uid = ?, updated_at = ?
+                    WHERE account_id = ? AND uid_validity = ?
+                    """,
+                    (last_synced_uid, int(time.time()), account_id, uid_validity),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE accounts
+                    SET imap_uid_validity = ?, last_synced_uid = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (uid_validity, last_synced_uid, int(time.time()), account_id),
+                )
+
+    def complete_mail_archive_rebuild(
+        self,
+        account_id: int,
+        uid_validity: str,
+        last_synced_uid: int,
+        timestamp: int,
+    ) -> None:
+        now = int(time.time())
+        with self._write_lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute(
+                "SELECT uid_validity FROM mail_sync_state WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if not state or str(state["uid_validity"]) != uid_validity:
+                raise RuntimeError("邮件暂存状态已变化")
+
+            # 新快照完整后再替换旧归档，读取方在事务提交前始终看到旧数据。
+            connection.execute(
+                "DELETE FROM mail_messages WHERE account_id = ?",
+                (account_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO mail_messages(
+                    owner_id, account_id, uid, message_id, subject,
+                    sender_name, sender_address, received_at, body,
+                    created_at, updated_at
+                )
+                SELECT
+                    accounts.owner_id, staged.account_id, staged.uid,
+                    staged.message_id, staged.subject, staged.sender_name,
+                    staged.sender_address, staged.received_at, staged.body,
+                    staged.created_at, staged.updated_at
+                FROM mail_sync_messages AS staged
+                JOIN accounts ON accounts.id = staged.account_id
+                WHERE staged.account_id = ?
+                """,
+                (account_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO mail_recipients(mail_message_id, email, recipient_type)
+                SELECT messages.id, staged.email, staged.recipient_type
+                FROM mail_sync_recipients AS staged
+                JOIN mail_messages AS messages
+                    ON messages.account_id = staged.account_id
+                    AND messages.uid = staged.uid
+                WHERE staged.account_id = ?
+                """,
+                (account_id,),
+            )
             connection.execute(
                 """
                 UPDATE accounts
-                SET imap_uid_validity = ?, last_synced_uid = ?, updated_at = ?
+                SET imap_uid_validity = ?, last_synced_uid = ?,
+                    last_archive_sync_at = ?, last_mail_at = ?,
+                    last_error = CASE
+                        WHEN last_mail_error IS NOT NULL THEN NULL
+                        ELSE last_error
+                    END,
+                    last_mail_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (uid_validity, last_synced_uid, int(time.time()), account_id),
+                (
+                    uid_validity,
+                    last_synced_uid,
+                    timestamp,
+                    timestamp,
+                    now,
+                    account_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM mail_sync_messages WHERE account_id = ?",
+                (account_id,),
+            )
+            connection.execute(
+                "DELETE FROM mail_sync_state WHERE account_id = ?",
+                (account_id,),
             )
 
     def list_mail_targets(self, owner_id: int) -> list[dict[str, Any]]:
@@ -1936,6 +2145,30 @@ class Store:
                 (job_id, public_token),
             ).fetchone()
             return self._refresh_job_response(connection, row) if row else None
+
+    def public_refresh_retry_after(
+        self,
+        public_token: str,
+        account_id: int,
+        cooldown_seconds: int,
+    ) -> int:
+        now = int(time.time())
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(refresh_jobs.completed_at) AS completed_at
+                FROM refresh_jobs
+                JOIN refresh_job_items
+                    ON refresh_job_items.job_id = refresh_jobs.id
+                WHERE refresh_jobs.public_token = ?
+                  AND refresh_jobs.mode = 'mail'
+                  AND refresh_jobs.status = 'completed'
+                  AND refresh_job_items.account_id = ?
+                """,
+                (public_token, account_id),
+            ).fetchone()
+        completed_at = int(row["completed_at"] or 0)
+        return max(0, cooldown_seconds - (now - completed_at))
 
     def requeue_running_refresh_items(self) -> None:
         now = int(time.time())

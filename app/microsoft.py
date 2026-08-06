@@ -443,36 +443,42 @@ class MailArchiveCoordinator:
                 raise TokenRefreshError("not_found", "邮箱不存在", True)
             try:
                 access_token = await self.token_service.get_access_token(account_id)
-                expected_uid_validity = str(account.get("imap_uid_validity") or "")
-                last_synced_uid = int(account.get("last_synced_uid") or 0)
+                cursor = self.store.get_mail_archive_cursor(account_id)
+                expected_uid_validity = str(cursor["uid_validity"])
+                last_synced_uid = int(cursor["last_synced_uid"])
+                rebuilding = bool(cursor["rebuilding"])
                 stored = 0
-                while True:
-                    result = await asyncio.to_thread(
-                        self.mailbox.list_messages_after,
-                        account["email"],
-                        access_token,
-                        expected_uid_validity,
-                        last_synced_uid,
-                        100,
-                    )
+
+                def archive_batch(result: dict[str, Any]) -> None:
+                    nonlocal rebuilding, stored, last_synced_uid
                     uid_validity = str(result["uid_validity"])
                     if result["reset"]:
-                        self.store.reset_mail_archive_cursor(account_id, uid_validity)
-                        expected_uid_validity = uid_validity
-                        last_synced_uid = 0
+                        self.store.begin_mail_archive_rebuild(account_id, uid_validity)
+                        rebuilding = True
                     messages = result["items"]
                     stored += self.store.archive_mail_messages(
-                        int(account["owner_id"]), account_id, messages
+                        int(account["owner_id"]),
+                        account_id,
+                        messages,
+                        staging=rebuilding,
                     )
                     last_synced_uid = int(result["last_uid"])
                     self.store.update_mail_archive_cursor(
                         account_id,
                         uid_validity,
                         last_synced_uid,
+                        rebuilding=rebuilding,
                     )
-                    expected_uid_validity = uid_validity
-                    if not result["has_more"]:
-                        break
+
+                sync_result = await asyncio.to_thread(
+                    self.mailbox.process_messages_after,
+                    account["email"],
+                    access_token,
+                    expected_uid_validity,
+                    last_synced_uid,
+                    100,
+                    archive_batch,
+                )
             except TokenRefreshError:
                 raise
             except MailboxError as exc:
@@ -482,7 +488,15 @@ class MailArchiveCoordinator:
                 raise
 
             synced_at = int(time.time())
-            self.store.mark_mail_archive_synced(account_id, synced_at)
+            if rebuilding:
+                self.store.complete_mail_archive_rebuild(
+                    account_id,
+                    str(sync_result["uid_validity"]),
+                    int(sync_result["last_uid"]),
+                    synced_at,
+                )
+            else:
+                self.store.mark_mail_archive_synced(account_id, synced_at)
             return {"stored": stored, "last_mail_at": synced_at}
 
     async def _worker(self, index: int) -> None:

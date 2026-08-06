@@ -10,7 +10,7 @@ from email.policy import default
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Callable
 
 
 class MailboxError(RuntimeError):
@@ -247,13 +247,14 @@ class OutlookMailbox:
             except imaplib.IMAP4.error:
                 pass
 
-    def list_messages_after(
+    def process_messages_after(
         self,
         email_address: str,
         access_token: str,
         expected_uid_validity: str,
         after_uid: int,
         batch_size: int,
+        on_batch: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
         connection = self._connect(email_address, access_token)
         try:
@@ -277,37 +278,47 @@ class OutlookMailbox:
             reset = bool(expected_uid_validity and expected_uid_validity != uid_validity)
             cursor = 0 if reset else max(0, after_uid)
             unseen_uids = [uid for uid in all_uids if uid > cursor]
-            selected = unseen_uids[:batch_size]
-            messages: list[dict[str, Any]] = []
-            for uid in selected:
-                status, payload = connection.uid(
-                    "fetch",
-                    str(uid).encode(),
-                    "(BODY.PEEK[]<0.1048576>)",
-                )
-                if status != "OK":
-                    raise MailboxError(f"无法读取邮件 UID {uid}")
-                parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
-                sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
-                messages.append(
+            size = max(1, batch_size)
+            offsets = range(0, len(unseen_uids), size) if unseen_uids else [0]
+            last_uid = cursor
+            for batch_index, offset in enumerate(offsets):
+                selected = unseen_uids[offset:offset + size]
+                messages: list[dict[str, Any]] = []
+                for uid in selected:
+                    status, payload = connection.uid(
+                        "fetch",
+                        str(uid).encode(),
+                        "(BODY.PEEK[]<0.1048576>)",
+                    )
+                    if status != "OK":
+                        raise MailboxError(f"无法读取邮件 UID {uid}")
+                    parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
+                    sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
+                    messages.append(
+                        {
+                            "uid": uid,
+                            "subject": _decode_header(parsed.get("Subject")) or "无主题",
+                            "sender_name": _decode_header(sender_name) or sender_address,
+                            "sender_address": sender_address,
+                            "received_at": _parse_date(parsed.get("Date")),
+                            "message_id": str(parsed.get("Message-ID") or ""),
+                            "body": _body_text(parsed),
+                            "recipients": _recipients(parsed),
+                        }
+                    )
+                if selected:
+                    last_uid = selected[-1]
+                has_more = offset + len(selected) < len(unseen_uids)
+                on_batch(
                     {
-                        "uid": uid,
-                        "subject": _decode_header(parsed.get("Subject")) or "无主题",
-                        "sender_name": _decode_header(sender_name) or sender_address,
-                        "sender_address": sender_address,
-                        "received_at": _parse_date(parsed.get("Date")),
-                        "message_id": str(parsed.get("Message-ID") or ""),
-                        "body": _body_text(parsed),
-                        "recipients": _recipients(parsed),
+                        "items": messages,
+                        "uid_validity": uid_validity,
+                        "reset": reset and batch_index == 0,
+                        "last_uid": last_uid,
+                        "has_more": has_more,
                     }
                 )
-            return {
-                "items": messages,
-                "uid_validity": uid_validity,
-                "reset": reset,
-                "last_uid": selected[-1] if selected else cursor,
-                "has_more": len(unseen_uids) > len(selected),
-            }
+            return {"uid_validity": uid_validity, "last_uid": last_uid}
         except imaplib.IMAP4.error as exc:
             raise MailboxError(f"读取收件箱失败：{exc}") from exc
         finally:

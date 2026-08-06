@@ -35,6 +35,7 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]{3,50}$")
 TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 VALID_STATUSES = {"active", "pending", "error", "invalid"}
 CAPTCHA_TTL_SECONDS = 10 * 60
+PUBLIC_REFRESH_COOLDOWN_SECONDS = 30
 PUBLIC_MAIL_PAGE_SIZE = 20
 PUBLIC_SHARE_HOST = (urlsplit(config.public_share_origin).hostname or "").lower()
 
@@ -76,7 +77,7 @@ async def add_security_headers(request: Request, call_next: Any) -> Response:
     )
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self'; "
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
         "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
         "base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
     )
@@ -603,6 +604,18 @@ async def refresh_public_mail(
         return JSONResponse({"detail": "链接不存在或已失效。"}, status_code=404)
     if not is_verified(request, token):
         return JSONResponse({"detail": "请先完成验证码验证。"}, status_code=403)
+
+    retry_after = store.public_refresh_retry_after(
+        token,
+        int(account["id"]),
+        PUBLIC_REFRESH_COOLDOWN_SECONDS,
+    )
+    if retry_after:
+        return JSONResponse(
+            {"detail": f"刷新过于频繁，请在 {retry_after} 秒后重试。"},
+            status_code=429,
+            headers={"Cache-Control": "no-store", "Retry-After": str(retry_after)},
+        )
 
     job = full_refresh_coordinator.start_job(
         int(account["owner_id"]),
