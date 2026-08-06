@@ -24,9 +24,11 @@
       if (!response.ok || !payload.status_url) {
         throw new Error(payload.detail || "刷新失败，请稍后再试。");
       }
+      // 状态响应不包含 status_url，轮询期间固定使用创建任务时返回的地址。
+      const statusUrl = payload.status_url;
       while (!payload.done) {
         await new Promise((resolve) => window.setTimeout(resolve, 650));
-        const statusResponse = await fetch(payload.status_url, {
+        const statusResponse = await fetch(statusUrl, {
           credentials: "same-origin",
           headers: { Accept: "application/json" },
         });
