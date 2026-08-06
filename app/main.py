@@ -35,7 +35,7 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]{3,50}$")
 TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 VALID_STATUSES = {"active", "pending", "error", "invalid"}
 CAPTCHA_TTL_SECONDS = 10 * 60
-PUBLIC_REFRESH_COOLDOWN_SECONDS = 30
+PUBLIC_REFRESH_COOLDOWN_SECONDS = 10
 PUBLIC_MAIL_PAGE_SIZE = 20
 PUBLIC_SHARE_HOST = (urlsplit(config.public_share_origin).hostname or "").lower()
 
@@ -249,7 +249,7 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "�
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <link rel="stylesheet" href="/static/public-mail.css?v=20260805-durable-refresh">
-  <script defer src="/static/public-mail.js?v=20260806-refresh-poll-fix"></script>
+  <script defer src="/static/public-mail.js?v=20260806-refresh-cooldown"></script>
   <title>{escape(title)}</title>
 </head>
 <body>
@@ -454,7 +454,7 @@ def render_public_mail_page(
         </div>
         <div class="section-actions">
           <span class="matched-mailbox">邮箱 <strong>{escape(email_address)}</strong></span>
-          <button class="btn btn-primary" id="public-refresh" type="button" data-refresh-url="/{escape(token)}/refresh?page={int(result['page'])}">刷新新邮件</button>
+          <button class="btn btn-primary" id="public-refresh" type="button" data-refresh-url="/{escape(token)}/refresh?page={int(result['page'])}" data-cooldown-seconds="{PUBLIC_REFRESH_COOLDOWN_SECONDS}">刷新新邮件</button>
         </div>
       </section>
       {render_public_mail_region(token, result)}

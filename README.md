@@ -24,7 +24,7 @@ Shared links can be configured with an expiry period or revoked immediately. Exp
 
 Responses include a restrictive content security policy and standard browser security headers. Browser icons are served locally so the management page does not execute third-party CDN scripts. The container applies a private file-creation mask to the database and backup files.
 
-The provided Nginx configurations rate-limit login attempts, CAPTCHA generation, verification attempts, and public refresh requests. Public mailbox refreshes also have a server-side 30-second cooldown.
+The provided Nginx configurations rate-limit login attempts, CAPTCHA generation, verification attempts, and public refresh requests. Public mailbox refreshes also have a server-side 10-second cooldown with a disabled-button countdown in the shared mailbox view.
 
 ## Microsoft Device Authorization
 

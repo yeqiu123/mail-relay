@@ -5,6 +5,31 @@
   if (!button || !mailRegion || !refreshUrl) return;
 
   const buttonLabel = button.innerHTML;
+  const cooldownSeconds = Number.parseInt(button.dataset.cooldownSeconds || "10", 10);
+  let cooldownTimer = null;
+
+  const startCooldown = (seconds) => {
+    let remaining = Math.max(1, Number.parseInt(String(seconds), 10) || cooldownSeconds);
+    button.disabled = true;
+
+    // 冷却期间直接在按钮内显示剩余秒数，归零后恢复可点击状态。
+    const renderCountdown = () => {
+      button.textContent = `${remaining}s 后可刷新`;
+    };
+    renderCountdown();
+    cooldownTimer = window.setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        window.clearInterval(cooldownTimer);
+        cooldownTimer = null;
+        button.disabled = false;
+        button.innerHTML = buttonLabel;
+        return;
+      }
+      renderCountdown();
+    }, 1000);
+  };
+
   button.addEventListener("click", async () => {
     if (button.disabled) return;
 
@@ -22,6 +47,9 @@
       });
       let payload = await response.json().catch(() => ({}));
       if (!response.ok || !payload.status_url) {
+        if (response.status === 429) {
+          startCooldown(response.headers.get("Retry-After"));
+        }
         throw new Error(payload.detail || "刷新失败，请稍后再试。");
       }
       // 状态响应不包含 status_url，轮询期间固定使用创建任务时返回的地址。
@@ -37,6 +65,7 @@
           throw new Error(payload.detail || "刷新失败，请稍后再试。");
         }
       }
+      startCooldown(cooldownSeconds);
       if (payload.failed || !payload.html) {
         throw new Error(payload.error || "刷新失败，请稍后再试。");
       }
@@ -50,8 +79,10 @@
       mailRegion.prepend(alert);
     } finally {
       mailRegion.removeAttribute("aria-busy");
-      button.disabled = false;
-      button.innerHTML = buttonLabel;
+      if (!cooldownTimer) {
+        button.disabled = false;
+        button.innerHTML = buttonLabel;
+      }
     }
   });
 })();
