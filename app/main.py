@@ -8,6 +8,7 @@ import string
 import time
 from contextlib import asynccontextmanager
 from html import escape
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlsplit
@@ -15,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -37,6 +39,7 @@ VALID_STATUSES = {"active", "pending", "error", "invalid"}
 CAPTCHA_TTL_SECONDS = 10 * 60
 PUBLIC_REFRESH_COOLDOWN_SECONDS = 10
 PUBLIC_MAIL_PAGE_SIZE = 20
+MAX_IMPORT_ACCOUNTS = 5000
 PUBLIC_SHARE_HOST = (urlsplit(config.public_share_origin).hostname or "").lower()
 
 vault = Vault(config.encryption_key)
@@ -160,10 +163,15 @@ class UserStatusPayload(BaseModel):
 
 def require_user(request: Request) -> dict[str, Any]:
     user_id = request.session.get("user_id")
-    if not isinstance(user_id, int):
+    session_version = request.session.get("session_version")
+    if not isinstance(user_id, int) or not isinstance(session_version, int):
         raise HTTPException(status_code=401, detail="请先登录")
     user = store.get_user(user_id)
-    if not user or not user["enabled"]:
+    if (
+        not user
+        or not user["enabled"]
+        or int(user["session_version"]) != session_version
+    ):
         request.session.clear()
         raise HTTPException(status_code=401, detail="账号已退出或停用")
     return user
@@ -223,6 +231,11 @@ def parse_import(content: str) -> list[dict[str, str]]:
         raise HTTPException(status_code=422, detail=detail)
     if not unique_records:
         raise HTTPException(status_code=422, detail="没有可导入的邮箱数据")
+    if len(unique_records) > MAX_IMPORT_ACCOUNTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"单次最多导入 {MAX_IMPORT_ACCOUNTS} 个邮箱",
+        )
 
     records.extend(unique_records.values())
     return records
@@ -249,7 +262,7 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "�
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <link rel="stylesheet" href="/static/public-mail.css?v=20260805-durable-refresh">
-  <script defer src="/static/public-mail.js?v=20260806-refresh-cooldown"></script>
+  <script defer src="/static/public-mail.js?v=20260810-refresh-timeout"></script>
   <title>{escape(title)}</title>
 </head>
 <body>
@@ -338,7 +351,7 @@ def render_captcha_page(token: str, error: str = "") -> str:
         </div>
         {error_html}
         <div class="captcha-box">
-          <img src="/{escape(token)}/captcha.svg?ts={int(time.time())}" alt="验证码" width="180" height="60">
+          <img src="/{escape(token)}/captcha.png?ts={int(time.time())}" alt="验证码" width="180" height="60">
           <p class="muted small">验证码有效期有限，请按图片准确输入。</p>
         </div>
         <form class="form-stack" method="post" action="/{escape(token)}/verify" autocomplete="off">
@@ -355,28 +368,40 @@ def render_captcha_page(token: str, error: str = "") -> str:
     return public_shell("邮件访问验证", body, status="安全验证")
 
 
-def captcha_svg(answer: str) -> str:
-    # 轻量 SVG 验证码，浏览器只保存随机挑战 ID。
-    chars = []
-    for index, char in enumerate(answer):
-        x = 46 + index * 24 + secrets.randbelow(5)
-        y = 38 + secrets.randbelow(8)
-        rotate = secrets.randbelow(28) - 14
-        chars.append(
-            f'<text x="{x}" y="{y}" transform="rotate({rotate} {x} {y})">{escape(char)}</text>'
-        )
-    lines = []
+def captcha_png(answer: str) -> bytes:
+    # 栅格化字符，避免验证码答案作为 SVG 文本直接暴露给客户端。
+    image = Image.new("RGB", (180, 60), (248, 250, 252))
+    draw = ImageDraw.Draw(image)
     for _ in range(5):
-        x1 = 16 + secrets.randbelow(35)
-        y1 = 13 + secrets.randbelow(36)
-        x2 = 128 + secrets.randbelow(35)
-        y2 = 13 + secrets.randbelow(36)
-        lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}"/>')
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="180" height="60" viewBox="0 0 180 60">
-  <rect width="180" height="60" rx="9" fill="#f8fafc"/>
-  <g stroke="#94a3b8" stroke-width="1.4" opacity="0.62">{''.join(lines)}</g>
-  <g fill="#1e293b" font-family="Georgia, serif" font-size="28" font-weight="700" letter-spacing="2">{''.join(chars)}</g>
-</svg>"""
+        draw.line(
+            (
+                8 + secrets.randbelow(45),
+                8 + secrets.randbelow(44),
+                125 + secrets.randbelow(48),
+                8 + secrets.randbelow(44),
+            ),
+            fill=(130 + secrets.randbelow(50), 145 + secrets.randbelow(45), 165),
+            width=1 + secrets.randbelow(2),
+        )
+    for _ in range(70):
+        x, y = secrets.randbelow(180), secrets.randbelow(60)
+        draw.point((x, y), fill=(150, 165 + secrets.randbelow(40), 185))
+
+    font = ImageFont.load_default(size=32)
+    for index, char in enumerate(answer):
+        glyph = Image.new("RGBA", (42, 50), (0, 0, 0, 0))
+        glyph_draw = ImageDraw.Draw(glyph)
+        glyph_draw.text((8, 4), char, font=font, fill=(25, 42, 68, 255))
+        glyph = glyph.rotate(
+            secrets.randbelow(25) - 12,
+            resample=Image.Resampling.BICUBIC,
+            expand=False,
+        )
+        image.paste(glyph, (24 + index * 34, 5 + secrets.randbelow(5)), glyph)
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def render_public_mail_list(result: dict[str, Any]) -> str:
@@ -503,6 +528,7 @@ async def index() -> FileResponse:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    store.health_check()
     return {"status": "ok"}
 
 
@@ -513,7 +539,7 @@ async def legacy_public_mail_view(token: str) -> Response:
     return RedirectResponse(f"{config.public_share_origin}/{token}", status_code=302)
 
 
-@app.get("/{token}/captcha.svg")
+@app.get("/{token}/captcha.png")
 async def public_captcha(token: str, request: Request) -> Response:
     if not TOKEN_PATTERN.match(token) or not is_public_host(request) or not store.get_shared_mailbox(token):
         return Response("not found", status_code=404)
@@ -528,8 +554,8 @@ async def public_captcha(token: str, request: Request) -> Response:
     )
     request.session[captcha_key(token)] = challenge_id
     return Response(
-        captcha_svg(answer),
-        media_type="image/svg+xml",
+        captcha_png(answer),
+        media_type="image/png",
         headers={"Cache-Control": "no-store"},
     )
 
@@ -606,7 +632,6 @@ async def refresh_public_mail(
         return JSONResponse({"detail": "请先完成验证码验证。"}, status_code=403)
 
     retry_after = store.public_refresh_retry_after(
-        token,
         int(account["id"]),
         PUBLIC_REFRESH_COOLDOWN_SECONDS,
     )
@@ -617,12 +642,19 @@ async def refresh_public_mail(
             headers={"Cache-Control": "no-store", "Retry-After": str(retry_after)},
         )
 
-    job = full_refresh_coordinator.start_job(
-        int(account["owner_id"]),
-        [int(account["id"])],
-        mode="mail",
-        public_token=token,
-    )
+    try:
+        job = full_refresh_coordinator.start_job(
+            int(account["owner_id"]),
+            [int(account["id"])],
+            mode="mail",
+            public_token=token,
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            {"detail": str(exc)},
+            status_code=429,
+            headers={"Cache-Control": "no-store", "Retry-After": "2"},
+        )
     return JSONResponse(
         {
             **job,
@@ -662,8 +694,14 @@ async def get_public_refresh_job(
 @app.get("/api/session")
 async def session_state(request: Request) -> dict[str, str | bool]:
     user_id = request.session.get("user_id")
+    session_version = request.session.get("session_version")
     user = store.get_user(user_id) if isinstance(user_id, int) else None
-    if not user or not user["enabled"]:
+    if (
+        not user
+        or not user["enabled"]
+        or not isinstance(session_version, int)
+        or int(user["session_version"]) != session_version
+    ):
         request.session.clear()
         return {"authenticated": False, "username": "", "role": ""}
     return {
@@ -681,6 +719,7 @@ async def login(payload: LoginPayload, request: Request) -> dict[str, str]:
 
     request.session.clear()
     request.session["user_id"] = int(user["id"])
+    request.session["session_version"] = int(user["session_version"])
     return {"username": str(user["username"]), "role": str(user["role"])}
 
 
@@ -827,14 +866,18 @@ async def import_accounts(
     user: CurrentUser,
 ) -> dict[str, int]:
     result = store.import_accounts(int(user["id"]), parse_import(payload.content))
-    job = full_refresh_coordinator.start_job(
-        int(user["id"]),
-        store.refreshable_ids(int(user["id"]), result["account_ids"]),
-    )
+    try:
+        job = full_refresh_coordinator.start_job(
+            int(user["id"]),
+            store.refreshable_ids(int(user["id"]), result["account_ids"]),
+        )
+        queued = int(job["total"])
+    except ValueError:
+        queued = 0
     return {
         "imported": int(result["imported"]),
         "updated": int(result["updated"]),
-        "queued": int(job["total"]),
+        "queued": queued,
     }
 
 
@@ -844,7 +887,10 @@ async def refresh_accounts(
     user: CurrentUser,
 ) -> dict[str, str | int | bool]:
     account_ids = store.refreshable_ids(int(user["id"]), payload.ids or None)
-    return full_refresh_coordinator.start_job(int(user["id"]), account_ids)
+    try:
+        return full_refresh_coordinator.start_job(int(user["id"]), account_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
 @app.get("/api/refresh-jobs/{job_id}")
@@ -1049,11 +1095,14 @@ async def sync_messages(account_id: int, user: CurrentUser) -> dict[str, object]
     account = store.get_account(account_id, int(user["id"]))
     if not account:
         raise HTTPException(status_code=404, detail="邮箱不存在")
-    return full_refresh_coordinator.start_job(
-        int(user["id"]),
-        [account_id],
-        mode="mail",
-    )
+    try:
+        return full_refresh_coordinator.start_job(
+            int(user["id"]),
+            [account_id],
+            mode="mail",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
 @app.get("/api/accounts/{account_id}/messages/{uid}")

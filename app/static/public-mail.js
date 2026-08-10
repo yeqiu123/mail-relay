@@ -54,7 +54,9 @@
       }
       // 状态响应不包含 status_url，轮询期间固定使用创建任务时返回的地址。
       const statusUrl = payload.status_url;
+      const deadline = Date.now() + 10 * 60 * 1000;
       while (!payload.done) {
+        if (Date.now() >= deadline) throw new Error("刷新任务等待超时，请稍后重试。");
         await new Promise((resolve) => window.setTimeout(resolve, 650));
         const statusResponse = await fetch(statusUrl, {
           credentials: "same-origin",

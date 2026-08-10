@@ -538,7 +538,9 @@ function hideRefreshLoading() {
 
 async function waitForRefreshJob(job, onUpdate = updateRefreshLoading) {
   let current = job;
+  const deadline = Date.now() + 10 * 60 * 1000;
   while (!current.done) {
+    if (Date.now() >= deadline) throw new Error("刷新任务等待超时，请稍后查看最新状态");
     await new Promise((resolve) => window.setTimeout(resolve, 650));
     current = await api(`/api/refresh-jobs/${encodeURIComponent(current.id)}`);
     if (onUpdate) onUpdate(current);

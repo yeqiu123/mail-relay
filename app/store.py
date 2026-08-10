@@ -17,6 +17,8 @@ DEFAULT_SETTINGS = {
     "refresh_interval_days": "7",
     "mail_page_size": "30",
 }
+MAX_ACTIVE_REFRESH_ITEMS_PER_OWNER = 5000
+RECIPIENT_HEADER_VERSION = "2"
 
 
 class Store:
@@ -364,6 +366,17 @@ class Store:
         )
 
     @staticmethod
+    def _create_service_heartbeats_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_heartbeats (
+                name        TEXT PRIMARY KEY,
+                updated_at  INTEGER NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
     def _ensure_share_link_columns(connection: sqlite3.Connection) -> None:
         for table in ("share_links", "target_share_links"):
             columns = Store._columns(connection, table)
@@ -385,20 +398,36 @@ class Store:
         password: str,
     ) -> int:
         now = int(time.time())
-        password_value = hash_password(password)
         existing = connection.execute(
-            "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+            "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
             (username,),
         ).fetchone()
         if existing:
             admin_id = int(existing["id"])
+            password_changed = not verify_password(
+                password,
+                str(existing["password_hash"]),
+            )
+            session_changed = (
+                password_changed
+                or str(existing["role"]) != "admin"
+                or not bool(existing["enabled"])
+            )
             connection.execute(
                 """
                 UPDATE users
-                SET password_hash = ?, role = 'admin', enabled = 1, updated_at = ?
+                SET password_hash = ?, role = 'admin', enabled = 1,
+                    session_version = session_version + ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (password_value, now, admin_id),
+                (
+                    hash_password(password)
+                    if password_changed
+                    else str(existing["password_hash"]),
+                    1 if session_changed else 0,
+                    now,
+                    admin_id,
+                ),
             )
             return admin_id
 
@@ -407,7 +436,7 @@ class Store:
             INSERT INTO users(username, password_hash, role, enabled, created_at, updated_at)
             VALUES (?, ?, 'admin', 1, ?, ?)
             """,
-            (username, password_value, now, now),
+            (username, hash_password(password), now, now),
         )
         return int(cursor.lastrowid)
 
@@ -487,6 +516,7 @@ class Store:
                     password_hash TEXT NOT NULL,
                     role          TEXT NOT NULL DEFAULT 'user',
                     enabled       INTEGER NOT NULL DEFAULT 1,
+                    session_version INTEGER NOT NULL DEFAULT 1,
                     created_at    INTEGER NOT NULL,
                     updated_at    INTEGER NOT NULL
                 );
@@ -497,6 +527,10 @@ class Store:
                 );
                 """
             )
+            if "session_version" not in self._columns(connection, "users"):
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1"
+                )
             admin_id = self._ensure_admin(
                 connection,
                 admin_username,
@@ -594,6 +628,7 @@ class Store:
             self._create_oauth_device_flows_table(connection)
             self._create_captcha_challenges_table(connection)
             self._create_refresh_jobs_tables(connection)
+            self._create_service_heartbeats_table(connection)
             self._ensure_share_link_columns(connection)
             connection.executescript(
                 """
@@ -657,6 +692,23 @@ class Store:
                   )
                 """
             )
+            recipient_version = connection.execute(
+                "SELECT value FROM settings WHERE key = 'recipient_header_version'"
+            ).fetchone()
+            if not recipient_version or str(recipient_version["value"]) != RECIPIENT_HEADER_VERSION:
+                # 收件人解析规则升级后重扫归档，补齐隐藏邮箱的投递头。
+                connection.execute("DELETE FROM mail_sync_messages")
+                connection.execute("DELETE FROM mail_sync_state")
+                connection.execute(
+                    "UPDATE accounts SET last_synced_uid = 0, last_archive_sync_at = NULL"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO settings(key, value) VALUES ('recipient_header_version', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (RECIPIENT_HEADER_VERSION,),
+                )
             connection.executemany(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                 DEFAULT_SETTINGS.items(),
@@ -714,6 +766,31 @@ class Store:
                 """
             )
 
+    def health_check(self) -> None:
+        with self._connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+
+    def touch_service_heartbeat(self, name: str) -> None:
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO service_heartbeats(name, updated_at)
+                VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (name, int(time.time())),
+            )
+
+    def service_heartbeat_is_fresh(self, name: str, max_age_seconds: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT updated_at FROM service_heartbeats WHERE name = ?",
+                (name,),
+            ).fetchone()
+        return bool(
+            row and int(row["updated_at"]) >= int(time.time()) - max_age_seconds
+        )
+
     @staticmethod
     def _public_user(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -721,6 +798,7 @@ class Store:
             "username": row["username"],
             "role": row["role"],
             "enabled": bool(row["enabled"]),
+            "session_version": int(row["session_version"]),
             "created_at": int(row["created_at"]),
             "updated_at": int(row["updated_at"]),
         }
@@ -787,7 +865,12 @@ class Store:
     def reset_user_password(self, user_id: int, password: str) -> bool:
         with self._write_lock, self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                """
+                UPDATE users
+                SET password_hash = ?, session_version = session_version + 1,
+                    updated_at = ?
+                WHERE id = ?
+                """,
                 (hash_password(password), int(time.time()), user_id),
             )
         return cursor.rowcount > 0
@@ -795,8 +878,18 @@ class Store:
     def set_user_enabled(self, user_id: int, enabled: bool) -> bool:
         with self._write_lock, self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?",
-                (1 if enabled else 0, int(time.time()), user_id),
+                """
+                UPDATE users
+                SET session_version = session_version + CASE WHEN enabled != ? THEN 1 ELSE 0 END,
+                    enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    1 if enabled else 0,
+                    1 if enabled else 0,
+                    int(time.time()),
+                    user_id,
+                ),
             )
         return cursor.rowcount > 0
 
@@ -1104,7 +1197,12 @@ class Store:
                         continue
                     email_address = str(recipient.get("email") or "").strip().lower()
                     recipient_type = str(recipient.get("recipient_type") or "").strip()
-                    if not email_address or recipient_type not in {"to", "cc"}:
+                    if not email_address or recipient_type not in {
+                        "to",
+                        "cc",
+                        "bcc",
+                        "envelope",
+                    }:
                         continue
                     if staging:
                         connection.execute(
@@ -1178,12 +1276,19 @@ class Store:
         return self._public_message(row) if row else None
 
     def due_archive_account_ids(self, interval_seconds: int) -> list[int]:
-        cutoff = int(time.time()) - interval_seconds
+        now = int(time.time())
+        cutoff = now - interval_seconds
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id FROM accounts
-                WHERE status IN ('active', 'pending')
+                WHERE status IN ('active', 'pending', 'error')
+                  AND (
+                      status != 'error'
+                      OR access_expires_at > ?
+                      OR next_refresh_at IS NULL
+                      OR next_refresh_at <= ?
+                  )
                   AND (
                       last_archive_sync_at IS NULL
                       OR last_archive_sync_at <= ?
@@ -1194,7 +1299,7 @@ class Store:
                   )
                 ORDER BY COALESCE(last_archive_sync_at, 0), id
                 """,
-                (cutoff,),
+                (now + 120, now, cutoff),
             ).fetchall()
         return [int(row["id"]) for row in rows]
 
@@ -1204,11 +1309,9 @@ class Store:
             connection.execute(
                 """
                 UPDATE accounts
-                SET last_archive_sync_at = ?, last_mail_at = ?,
-                    last_error = CASE
-                        WHEN last_mail_error IS NOT NULL THEN NULL
-                        ELSE last_error
-                    END,
+                SET status = CASE WHEN status = 'invalid' THEN status ELSE 'active' END,
+                    last_archive_sync_at = ?, last_mail_at = ?,
+                    last_error = CASE WHEN status = 'invalid' THEN last_error ELSE NULL END,
                     last_mail_error = NULL,
                     updated_at = ?
                 WHERE id = ?
@@ -1349,12 +1452,10 @@ class Store:
             connection.execute(
                 """
                 UPDATE accounts
-                SET imap_uid_validity = ?, last_synced_uid = ?,
+                SET status = CASE WHEN status = 'invalid' THEN status ELSE 'active' END,
+                    imap_uid_validity = ?, last_synced_uid = ?,
                     last_archive_sync_at = ?, last_mail_at = ?,
-                    last_error = CASE
-                        WHEN last_mail_error IS NOT NULL THEN NULL
-                        ELSE last_error
-                    END,
+                    last_error = CASE WHEN status = 'invalid' THEN last_error ELSE NULL END,
                     last_mail_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,
@@ -1375,6 +1476,55 @@ class Store:
                 "DELETE FROM mail_sync_state WHERE account_id = ?",
                 (account_id,),
             )
+
+    def prune_mail_archive(self, account_id: int, max_messages: int) -> int:
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM mail_messages
+                WHERE id IN (
+                    SELECT id FROM mail_messages
+                    WHERE account_id = ?
+                    ORDER BY CAST(uid AS INTEGER) DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (account_id, max_messages),
+            )
+        return int(cursor.rowcount)
+
+    def prune_mail_archives_batch(
+        self,
+        max_messages: int,
+        batch_size: int = 500,
+    ) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id
+                            ORDER BY CAST(uid AS INTEGER) DESC, id DESC
+                        ) AS position
+                    FROM mail_messages
+                )
+                WHERE position > ?
+                LIMIT ?
+                """,
+                (max_messages, batch_size),
+            ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM mail_messages WHERE id IN ({placeholders})",
+                ids,
+            )
+            return int(cursor.rowcount)
 
     def list_mail_targets(self, owner_id: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -2050,36 +2200,93 @@ class Store:
         mode: str,
         public_token: str | None = None,
     ) -> dict[str, Any]:
+        if mode not in {"full", "mail"}:
+            raise ValueError("刷新模式无效")
         ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
         now = int(time.time())
         with self._write_lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "DELETE FROM refresh_jobs WHERE completed_at IS NOT NULL AND completed_at < ?",
                 (now - 7 * 86400,),
             )
-            if mode == "mail" and len(ids) == 1:
-                existing = connection.execute(
-                    """
-                    SELECT refresh_jobs.*
+
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                valid_rows = connection.execute(
+                    f"""
+                    SELECT id FROM accounts
+                    WHERE owner_id = ? AND provider = 'outlook'
+                      AND id IN ({placeholders})
+                    """,
+                    [owner_id, *ids],
+                ).fetchall()
+                valid_ids = {int(row["id"]) for row in valid_rows}
+                ids = [account_id for account_id in ids if account_id in valid_ids]
+
+            active_by_account: dict[int, sqlite3.Row] = {}
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                active_rows = connection.execute(
+                    f"""
+                    SELECT refresh_jobs.*, refresh_job_items.account_id AS active_account_id
                     FROM refresh_jobs
                     JOIN refresh_job_items
                         ON refresh_job_items.job_id = refresh_jobs.id
                     WHERE refresh_jobs.owner_id = ?
-                      AND refresh_jobs.mode = 'mail'
-                      AND refresh_jobs.public_token IS ?
                       AND refresh_jobs.status IN ('queued', 'running')
-                      AND refresh_job_items.account_id = ?
                       AND refresh_job_items.status IN ('queued', 'running')
-                    ORDER BY refresh_jobs.created_at DESC LIMIT 1
+                      AND refresh_job_items.account_id IN ({placeholders})
+                    ORDER BY refresh_jobs.created_at DESC
                     """,
-                    (owner_id, public_token, ids[0]),
-                ).fetchone()
-                if existing:
+                    [owner_id, *ids],
+                ).fetchall()
+                for row in active_rows:
+                    active_by_account.setdefault(int(row["active_account_id"]), row)
+
+            if public_token and len(ids) != 1:
+                raise ValueError("公开链接一次只能刷新一个邮箱")
+            if public_token and ids and ids[0] in active_by_account:
+                existing = active_by_account[ids[0]]
+                if existing["mode"] == "mail" and existing["public_token"] == public_token:
                     return self._refresh_job_response(connection, existing)
+                raise ValueError("邮箱正在刷新，请稍后重试")
+            if not public_token and len(ids) == 1 and ids[0] in active_by_account:
+                existing = active_by_account[ids[0]]
+                if mode == "full" and existing["mode"] == "mail":
+                    raise ValueError("邮箱正在同步邮件，请完成后再执行完整校验")
+                return self._refresh_job_response(connection, existing)
+            if not public_token and active_by_account:
+                raise ValueError("部分邮箱已有刷新任务，请完成后再重试")
+            if not ids:
+                return {
+                    "id": "",
+                    "mode": mode,
+                    "total": 0,
+                    "completed": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "done": True,
+                    "error": "",
+                }
+
+            active_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM refresh_job_items
+                    JOIN refresh_jobs ON refresh_jobs.id = refresh_job_items.job_id
+                    WHERE refresh_jobs.owner_id = ?
+                      AND refresh_jobs.status IN ('queued', 'running')
+                      AND refresh_job_items.status IN ('queued', 'running')
+                    """,
+                    (owner_id,),
+                ).fetchone()[0]
+            )
+            if active_count + len(ids) > MAX_ACTIVE_REFRESH_ITEMS_PER_OWNER:
+                raise ValueError("刷新任务过多，请等待当前任务完成后重试")
 
             job_id = uuid.uuid4().hex
-            status = "completed" if not ids else "queued"
-            completed_at = now if not ids else None
             connection.execute(
                 """
                 INSERT INTO refresh_jobs(
@@ -2092,11 +2299,11 @@ class Store:
                     owner_id,
                     mode,
                     public_token,
-                    status,
+                    "queued",
                     len(ids),
                     now,
                     now,
-                    completed_at,
+                    None,
                 ),
             )
             connection.executemany(
@@ -2111,8 +2318,14 @@ class Store:
                 connection.execute(
                     f"""
                     UPDATE accounts
-                    SET full_refresh_pending = 1, last_error = NULL,
-                        last_mail_error = NULL, updated_at = ?
+                    SET full_refresh_pending = 1,
+                        last_error = CASE
+                            WHEN status = 'invalid' THEN last_error ELSE NULL
+                        END,
+                        last_mail_error = CASE
+                            WHEN status = 'invalid' THEN last_mail_error ELSE NULL
+                        END,
+                        updated_at = ?
                     WHERE owner_id = ? AND id IN ({placeholders})
                     """,
                     [now, owner_id, *ids],
@@ -2148,7 +2361,6 @@ class Store:
 
     def public_refresh_retry_after(
         self,
-        public_token: str,
         account_id: int,
         cooldown_seconds: int,
     ) -> int:
@@ -2160,12 +2372,12 @@ class Store:
                 FROM refresh_jobs
                 JOIN refresh_job_items
                     ON refresh_job_items.job_id = refresh_jobs.id
-                WHERE refresh_jobs.public_token = ?
+                WHERE refresh_jobs.public_token IS NOT NULL
                   AND refresh_jobs.mode = 'mail'
                   AND refresh_jobs.status = 'completed'
                   AND refresh_job_items.account_id = ?
                 """,
-                (public_token, account_id),
+                (account_id,),
             ).fetchone()
         completed_at = int(row["completed_at"] or 0)
         return max(0, cooldown_seconds - (now - completed_at))
@@ -2411,8 +2623,14 @@ class Store:
             connection.execute(
                 f"""
                 UPDATE accounts
-                SET full_refresh_pending = 1, last_error = NULL,
-                    last_mail_error = NULL, updated_at = ?
+                SET full_refresh_pending = 1,
+                    last_error = CASE
+                        WHEN status = 'invalid' THEN last_error ELSE NULL
+                    END,
+                    last_mail_error = CASE
+                        WHEN status = 'invalid' THEN last_mail_error ELSE NULL
+                    END,
+                    updated_at = ?
                 WHERE id IN ({placeholders})
                 """,
                 [now, *ids],
@@ -2423,8 +2641,9 @@ class Store:
             connection.execute(
                 """
                 UPDATE accounts
-                SET status = 'active', full_refresh_pending = 0,
-                    last_error = NULL,
+                SET status = CASE WHEN status = 'invalid' THEN status ELSE 'active' END,
+                    full_refresh_pending = 0,
+                    last_error = CASE WHEN status = 'invalid' THEN last_error ELSE NULL END,
                     last_mail_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,

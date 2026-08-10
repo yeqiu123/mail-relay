@@ -322,6 +322,10 @@ class RefreshCoordinator:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+    @property
+    def tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        return tuple(self._tasks)
+
     async def enqueue(self, account_ids: list[int]) -> int:
         queued = 0
         async with self._queued_lock:
@@ -386,6 +390,7 @@ class MailArchiveCoordinator:
         worker_count: int,
         scheduler_seconds: int,
         sync_interval_seconds: int,
+        archive_max_messages: int,
     ) -> None:
         self.store = store
         self.token_service = token_service
@@ -393,6 +398,7 @@ class MailArchiveCoordinator:
         self.worker_count = worker_count
         self.scheduler_seconds = scheduler_seconds
         self.sync_interval_seconds = sync_interval_seconds
+        self.archive_max_messages = archive_max_messages
         self.queue: asyncio.Queue[int] = asyncio.Queue()
         self._queued_ids: set[int] = set()
         self._queued_lock = asyncio.Lock()
@@ -424,6 +430,10 @@ class MailArchiveCoordinator:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+    @property
+    def tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        return tuple(self._tasks)
 
     async def enqueue(self, account_ids: list[int]) -> int:
         queued = 0
@@ -477,6 +487,7 @@ class MailArchiveCoordinator:
                     expected_uid_validity,
                     last_synced_uid,
                     100,
+                    self.archive_max_messages,
                     archive_batch,
                 )
             except TokenRefreshError:
@@ -497,6 +508,7 @@ class MailArchiveCoordinator:
                 )
             else:
                 self.store.mark_mail_archive_synced(account_id, synced_at)
+            self.store.prune_mail_archive(account_id, self.archive_max_messages)
             return {"stored": stored, "last_mail_at": synced_at}
 
     async def _worker(self, index: int) -> None:
@@ -521,6 +533,11 @@ class MailArchiveCoordinator:
             await asyncio.sleep(self.scheduler_seconds)
             await self.enqueue(
                 self.store.due_archive_account_ids(self.sync_interval_seconds)
+            )
+            # 每轮仅清理一小批历史邮件，避免大库清理阻塞工作进程心跳。
+            await asyncio.to_thread(
+                self.store.prune_mail_archives_batch,
+                self.archive_max_messages,
             )
 
     def status(self) -> dict[str, int]:
@@ -565,6 +582,10 @@ class FullRefreshCoordinator:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+    @property
+    def tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        return tuple(self._tasks)
 
     def start_job(
         self,

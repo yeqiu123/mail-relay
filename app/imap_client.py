@@ -13,6 +13,9 @@ from html.parser import HTMLParser
 from typing import Any, Callable
 
 
+MAX_UID_SEARCH_BLOCKS = 100
+
+
 class MailboxError(RuntimeError):
     def __init__(self, message: str, authentication_failed: bool = False) -> None:
         super().__init__(message)
@@ -78,6 +81,88 @@ def _message_bytes(data: list[Any]) -> bytes:
     if not chunks:
         raise MailboxError("Microsoft IMAP 未返回有效邮件内容")
     return b"".join(chunks)
+
+
+def _message_size(data: list[Any]) -> int | None:
+    for item in data:
+        if not isinstance(item, tuple) or not item:
+            continue
+        metadata = item[0]
+        if not isinstance(metadata, (bytes, bytearray)):
+            continue
+        match = re.search(rb"RFC822\.SIZE\s+(\d+)", metadata)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _mailbox_count(data: list[Any]) -> int:
+    if not data or not isinstance(data[0], (bytes, bytearray)):
+        return 0
+    try:
+        return max(0, int(data[0]))
+    except ValueError:
+        return 0
+
+
+def _response_number(connection: imaplib.IMAP4_SSL, name: str) -> int:
+    _, data = connection.response(name)
+    value = (data or [b""])[-1]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise MailboxError(f"无法读取 INBOX {name}") from None
+
+
+def _recent_uids_after(
+    connection: imaplib.IMAP4_SSL,
+    after_uid: int,
+    limit: int,
+) -> list[int]:
+    lower = max(1, after_uid + 1)
+    upper = _response_number(connection, "UIDNEXT") - 1
+    if upper < lower:
+        return []
+
+    block_size = max(100, limit)
+    uids: set[int] = set()
+    for _ in range(MAX_UID_SEARCH_BLOCKS):
+        start = max(lower, upper - block_size + 1)
+        status, data = connection.uid("search", None, "UID", f"{start}:{upper}")
+        if status != "OK":
+            raise MailboxError("无法搜索 INBOX 邮件")
+        for chunk in data or []:
+            if isinstance(chunk, (bytes, bytearray)):
+                uids.update(int(value) for value in chunk.split() if value.isdigit())
+        upper = start - 1
+        if len(uids) >= limit or upper < lower:
+            break
+    else:
+        raise MailboxError("INBOX UID 范围过大，已停止本次同步")
+
+    return sorted(uids)[-limit:]
+
+
+def _sequence_uids(
+    connection: imaplib.IMAP4_SSL,
+    start: int,
+    end: int,
+) -> list[int]:
+    if start > end:
+        return []
+    status, data = connection.fetch(f"{start}:{end}", "(UID)")
+    if status != "OK":
+        raise MailboxError("无法读取 INBOX UID 列表")
+    uids: set[int] = set()
+    for item in data or []:
+        parts = item if isinstance(item, tuple) else (item,)
+        for part in parts:
+            if not isinstance(part, (bytes, bytearray)):
+                continue
+            match = re.search(rb"\bUID\s+(\d+)", part)
+            if match:
+                uids.add(int(match.group(1)))
+    return sorted(uids)
 
 
 def _compact_text(value: str) -> str:
@@ -158,8 +243,31 @@ def _body_text(message: Message) -> str:
 def _recipients(message: Message) -> list[dict[str, str]]:
     recipients: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for recipient_type, header in (("to", "To"), ("cc", "Cc")):
-        for _, address in getaddresses([str(message.get(header) or "")]):
+    recipient_headers = {
+        "to": ("To",),
+        "cc": ("Cc",),
+        "bcc": ("Bcc",),
+        "envelope": (
+            "Delivered-To",
+            "X-Original-To",
+            "Envelope-To",
+            "X-Envelope-To",
+            "X-MS-Exchange-Organization-OriginalEnvelopeRecipient",
+            "X-MS-Exchange-Organization-OriginalEnvelopeRecipients",
+        ),
+    }
+    for recipient_type, headers in recipient_headers.items():
+        values = [
+            str(value)
+            for header in headers
+            for value in message.get_all(header, [])
+        ]
+        if recipient_type == "envelope":
+            values = [
+                re.sub(r"(?i)\bSMTP:", "", value).replace(";", ",").strip(" ,")
+                for value in values
+            ]
+        for _, address in getaddresses(values):
             email_address = address.strip().lower()
             key = (email_address, recipient_type)
             if not email_address or key in seen:
@@ -172,9 +280,41 @@ def _recipients(message: Message) -> list[dict[str, str]]:
 
 
 class OutlookMailbox:
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, max_message_bytes: int) -> None:
         self.host = host
         self.port = port
+        self.max_message_bytes = max_message_bytes
+
+    def _fetch_message(
+        self,
+        connection: imaplib.IMAP4_SSL,
+        uid: str,
+    ) -> dict[str, Any]:
+        status, payload = connection.uid(
+            "fetch",
+            uid.encode(),
+            f"(RFC822.SIZE BODY.PEEK[]<0.{self.max_message_bytes}>)",
+        )
+        if status != "OK":
+            raise MailboxError(f"无法读取邮件 UID {uid}")
+
+        parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
+        sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
+        body = _body_text(parsed)
+        source_size = _message_size(payload)
+        if source_size and source_size > self.max_message_bytes:
+            marker = f"\n\n[邮件超过 {self.max_message_bytes} 字节，正文仅保留已读取部分]"
+            body = body[: max(0, 200_000 - len(marker))] + marker
+        return {
+            "uid": uid,
+            "subject": _decode_header(parsed.get("Subject")) or "无主题",
+            "sender_name": _decode_header(sender_name) or sender_address,
+            "sender_address": sender_address,
+            "received_at": _parse_date(parsed.get("Date")),
+            "message_id": str(parsed.get("Message-ID") or ""),
+            "body": body,
+            "recipients": _recipients(parsed),
+        }
 
     def _connect(self, email_address: str, access_token: str) -> imaplib.IMAP4_SSL:
         try:
@@ -206,38 +346,18 @@ class OutlookMailbox:
     ) -> list[dict[str, Any]]:
         connection = self._connect(email_address, access_token)
         try:
-            status, _ = connection.select("INBOX", readonly=True)
+            status, selected_data = connection.select("INBOX", readonly=True)
             if status != "OK":
                 raise MailboxError("无法打开 INBOX")
-            status, data = connection.uid("search", None, "ALL")
-            if status != "OK" or not data or not data[0]:
+            total = _mailbox_count(selected_data)
+            if not total:
                 return []
 
-            uids = [int(x) for x in data[0].split()]
+            uids = _sequence_uids(connection, max(1, total - limit + 1), total)
             selected = [str(x) for x in sorted(uids, reverse=True)[:limit]]
             messages: list[dict[str, Any]] = []
             for uid in selected:
-                status, payload = connection.uid(
-                    "fetch",
-                    uid.encode(),
-                    "(BODY.PEEK[]<0.1048576>)",
-                )
-                if status != "OK":
-                    raise MailboxError(f"无法读取邮件 UID {uid}")
-                parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
-                sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
-                messages.append(
-                    {
-                        "uid": uid,
-                        "subject": _decode_header(parsed.get("Subject")) or "无主题",
-                        "sender_name": _decode_header(sender_name) or sender_address,
-                        "sender_address": sender_address,
-                        "received_at": _parse_date(parsed.get("Date")),
-                        "message_id": str(parsed.get("Message-ID") or ""),
-                        "body": _body_text(parsed),
-                        "recipients": _recipients(parsed),
-                    }
-                )
+                messages.append(self._fetch_message(connection, uid))
             return messages
         except imaplib.IMAP4.error as exc:
             raise MailboxError(f"读取收件箱失败：{exc}") from exc
@@ -254,6 +374,7 @@ class OutlookMailbox:
         expected_uid_validity: str,
         after_uid: int,
         batch_size: int,
+        message_limit: int,
         on_batch: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
         connection = self._connect(email_address, access_token)
@@ -271,13 +392,13 @@ class OutlookMailbox:
             if not uid_validity:
                 raise MailboxError("无法读取 INBOX UIDVALIDITY")
 
-            status, data = connection.uid("search", None, "ALL")
-            if status != "OK":
-                raise MailboxError("无法搜索 INBOX 邮件")
-            all_uids = sorted(int(value) for value in (data[0].split() if data and data[0] else []))
             reset = bool(expected_uid_validity and expected_uid_validity != uid_validity)
             cursor = 0 if reset else max(0, after_uid)
-            unseen_uids = [uid for uid in all_uids if uid > cursor]
+            unseen_uids = _recent_uids_after(
+                connection,
+                cursor,
+                max(1, message_limit),
+            )
             size = max(1, batch_size)
             offsets = range(0, len(unseen_uids), size) if unseen_uids else [0]
             last_uid = cursor
@@ -285,27 +406,7 @@ class OutlookMailbox:
                 selected = unseen_uids[offset:offset + size]
                 messages: list[dict[str, Any]] = []
                 for uid in selected:
-                    status, payload = connection.uid(
-                        "fetch",
-                        str(uid).encode(),
-                        "(BODY.PEEK[]<0.1048576>)",
-                    )
-                    if status != "OK":
-                        raise MailboxError(f"无法读取邮件 UID {uid}")
-                    parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
-                    sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
-                    messages.append(
-                        {
-                            "uid": uid,
-                            "subject": _decode_header(parsed.get("Subject")) or "无主题",
-                            "sender_name": _decode_header(sender_name) or sender_address,
-                            "sender_address": sender_address,
-                            "received_at": _parse_date(parsed.get("Date")),
-                            "message_id": str(parsed.get("Message-ID") or ""),
-                            "body": _body_text(parsed),
-                            "recipients": _recipients(parsed),
-                        }
-                    )
+                    messages.append(self._fetch_message(connection, str(uid)))
                 if selected:
                     last_uid = selected[-1]
                 has_more = offset + len(selected) < len(unseen_uids)
@@ -336,42 +437,27 @@ class OutlookMailbox:
     ) -> dict[str, Any]:
         connection = self._connect(email_address, access_token)
         try:
-            status, _ = connection.select("INBOX", readonly=True)
+            status, selected_data = connection.select("INBOX", readonly=True)
             if status != "OK":
                 raise MailboxError("无法打开 INBOX")
-            status, data = connection.uid("search", None, "ALL")
-            if status != "OK" or not data or not data[0]:
+            total = _mailbox_count(selected_data)
+            if not total:
                 return {"items": [], "total": 0, "page": page, "page_size": page_size}
 
-            uids = [int(x) for x in data[0].split()]
             offset = (page - 1) * page_size
-            selected = [str(x) for x in sorted(uids, reverse=True)[offset:offset + page_size]]
+            end = total - offset
+            start = max(1, end - page_size + 1)
+            uids = _sequence_uids(connection, start, end)
+            selected = [str(x) for x in sorted(uids, reverse=True)]
             messages: list[dict[str, Any]] = []
             for uid in selected:
-                status, payload = connection.uid(
-                    "fetch",
-                    uid.encode(),
-                    "(BODY.PEEK[]<0.1048576>)",
-                )
-                if status != "OK":
+                try:
+                    messages.append(self._fetch_message(connection, uid))
+                except MailboxError:
                     continue
-                parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
-                sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
-                messages.append(
-                    {
-                        "uid": uid,
-                        "subject": _decode_header(parsed.get("Subject")) or "无主题",
-                        "sender_name": _decode_header(sender_name) or sender_address,
-                        "sender_address": sender_address,
-                        "received_at": _parse_date(parsed.get("Date")),
-                        "message_id": str(parsed.get("Message-ID") or ""),
-                        "body": _body_text(parsed),
-                        "recipients": _recipients(parsed),
-                    }
-                )
             return {
                 "items": messages,
-                "total": len(uids),
+                "total": total,
                 "page": page,
                 "page_size": page_size,
             }
@@ -397,26 +483,7 @@ class OutlookMailbox:
             status, _ = connection.select("INBOX", readonly=True)
             if status != "OK":
                 raise MailboxError("无法打开 INBOX")
-            status, payload = connection.uid(
-                "fetch",
-                uid.encode(),
-                "(BODY.PEEK[]<0.1048576>)",
-            )
-            if status != "OK":
-                raise MailboxError("无法读取邮件正文")
-
-            parsed = email.message_from_bytes(_message_bytes(payload), policy=default)
-            sender_name, sender_address = parseaddr(_decode_header(parsed.get("From")))
-            return {
-                "uid": uid,
-                "subject": _decode_header(parsed.get("Subject")) or "无主题",
-                "sender_name": _decode_header(sender_name) or sender_address,
-                "sender_address": sender_address,
-                "received_at": _parse_date(parsed.get("Date")),
-                "message_id": str(parsed.get("Message-ID") or ""),
-                "body": _body_text(parsed),
-                "recipients": _recipients(parsed),
-            }
+            return self._fetch_message(connection, uid)
         except imaplib.IMAP4.error as exc:
             raise MailboxError(f"读取邮件正文失败：{exc}") from exc
         finally:

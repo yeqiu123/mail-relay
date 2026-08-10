@@ -27,6 +27,8 @@ class AppConfig:
     refresh_workers: int
     scheduler_seconds: int
     mail_sync_interval_seconds: int
+    mail_fetch_max_bytes: int
+    mail_archive_max_messages: int
     public_share_origin: str
 
     @classmethod
@@ -50,6 +52,14 @@ class AppConfig:
             scheduler_seconds=max(60, int(os.getenv("SCHEDULER_SECONDS", "300"))),
             mail_sync_interval_seconds=max(
                 60, int(os.getenv("MAIL_SYNC_INTERVAL_SECONDS", "300"))
+            ),
+            mail_fetch_max_bytes=max(
+                262_144,
+                min(20_971_520, int(os.getenv("MAIL_FETCH_MAX_BYTES", "5242880"))),
+            ),
+            mail_archive_max_messages=max(
+                100,
+                min(20_000, int(os.getenv("MAIL_ARCHIVE_MAX_MESSAGES", "5000"))),
             ),
             public_share_origin=os.getenv(
                 "PUBLIC_SHARE_ORIGIN",

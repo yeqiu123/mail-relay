@@ -25,6 +25,12 @@ services:
       - .env
     volumes:
       - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.config import config; from app.security import Vault; from app.store import Store; raise SystemExit(0 if Store(config.database_path, Vault(config.encryption_key)).service_heartbeat_is_fresh('worker', 45) else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
     depends_on:
       mail-relay:
         condition: service_healthy
