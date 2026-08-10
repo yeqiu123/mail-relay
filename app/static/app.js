@@ -136,7 +136,7 @@ function setButtonBusy(button, busy, label = "处理中") {
   if (busy) {
     button.dataset.originalHtml = button.innerHTML;
     button.disabled = true;
-    button.innerHTML = `<span class="spinner"></span><span>${escapeHtml(label)}</span>`;
+    button.innerHTML = `<span class="spinner"></span>${label ? `<span>${escapeHtml(label)}</span>` : ""}`;
   } else {
     button.innerHTML = button.dataset.originalHtml || button.innerHTML;
     button.disabled = false;
@@ -546,11 +546,11 @@ async function waitForRefreshJob(job, onUpdate = updateRefreshLoading) {
   return current;
 }
 
-async function queueRefresh(ids, { button = $("#refresh-button") } = {}) {
+async function queueRefresh(ids, { button = $("#refresh-button"), showLabel = true } = {}) {
   if (state.refreshing) return;
   state.refreshing = true;
   showRefreshLoading({ preparing: true });
-  setButtonBusy(button, true, "校验中");
+  setButtonBusy(button, true, showLabel ? "校验中" : "");
   try {
     const started = await api("/api/accounts/refresh", {
       method: "POST",
@@ -1556,7 +1556,7 @@ function bindEvents() {
     if (button.dataset.action === "copy-email") copyEmailAddress(account.email);
     if (button.dataset.action === "mail") openDrawer(account);
     if (button.dataset.action === "share") generateShareLink(id);
-    if (button.dataset.action === "refresh") queueRefresh([id], { button });
+    if (button.dataset.action === "refresh") queueRefresh([id], { button, showLabel: false });
     if (button.dataset.action === "delete") deleteAccounts([id]);
   });
   $("#share-button").addEventListener("click", () => {
