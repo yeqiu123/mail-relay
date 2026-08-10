@@ -577,7 +577,7 @@ async function refreshMailbox(button) {
   const account = state.mailAccount;
   if (!account || button.disabled) return;
 
-  setButtonBusy(button, true, "拉取中");
+  setButtonBusy(button, true, "");
   try {
     // 收件箱内的刷新只同步最新邮件，不触发账户授权校验。
     const started = await api(`/api/accounts/${account.id}/messages/sync`, { method: "POST" });
