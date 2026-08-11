@@ -261,6 +261,8 @@ class MicrosoftTokenService:
             status,
             message,
             retry_at,
+            code=code,
+            source="token",
         )
         self.store.add_refresh_log(
             account["id"],
@@ -354,6 +356,8 @@ class RefreshCoordinator:
                         "error",
                         message,
                         int(time.time()) + 3600,
+                        code="internal_error",
+                        source="system",
                     )
                     self.store.add_refresh_log(
                         account_id,
@@ -495,7 +499,12 @@ class MailArchiveCoordinator:
             except MailboxError as exc:
                 # 可重试的 IMAP 会话错误不应把可读取账户永久标为异常。
                 if exc.authentication_failed:
-                    self.store.set_mail_error(account_id, str(exc))
+                    self.store.set_mail_error(
+                        account_id,
+                        str(exc),
+                        code="imap_authentication_failed",
+                        source="imap",
+                    )
                 raise
 
             synced_at = int(time.time())
@@ -521,7 +530,10 @@ class MailArchiveCoordinator:
                 pass
             except Exception as exc:
                 self.store.set_mail_error(
-                    account_id, f"internal_error: {exc.__class__.__name__}"
+                    account_id,
+                    f"internal_error: {exc.__class__.__name__}",
+                    code="internal_error",
+                    source="system",
                 )
             finally:
                 async with self._queued_lock:
@@ -671,19 +683,49 @@ class FullRefreshCoordinator:
                         int(account_id),
                         exc.description,
                         permanent=exc.permanent,
+                        code=exc.code,
+                        source="token",
                     )
             except MailboxError as exc:
                 error = str(exc)
-                if mode == "full" and account_id is not None:
-                    self.store.mark_full_refresh_failure(
-                        int(account_id),
-                        str(exc),
-                        mail_error=True,
+                if account_id is not None:
+                    code = (
+                        "imap_authentication_failed"
+                        if exc.authentication_failed
+                        else "imap_error"
                     )
+                    if mode == "full":
+                        self.store.mark_full_refresh_failure(
+                            int(account_id),
+                            str(exc),
+                            mail_error=True,
+                            code=code,
+                            source="imap",
+                        )
+                    else:
+                        self.store.set_mail_error(
+                            int(account_id),
+                            str(exc),
+                            code=code,
+                            source="imap",
+                        )
             except Exception as exc:
                 error = f"internal_error: {exc.__class__.__name__}"
-                if mode == "full" and account_id is not None:
-                    self.store.mark_full_refresh_failure(int(account_id), error)
+                if account_id is not None:
+                    if mode == "full":
+                        self.store.mark_full_refresh_failure(
+                            int(account_id),
+                            error,
+                            code="internal_error",
+                            source="system",
+                        )
+                    else:
+                        self.store.set_mail_error(
+                            int(account_id),
+                            error,
+                            code="internal_error",
+                            source="system",
+                        )
             finally:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)

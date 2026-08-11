@@ -2633,3 +2633,166 @@ textarea {
   color: var(--ink-faint);
   font-size: 12px;
 }
+
+/* 状态旁仅保留异常详情入口，避免拉宽表格状态列。 */
+.status-cell-content {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.error-detail-trigger {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--ink-faint);
+}
+
+.error-detail-trigger:hover {
+  background: var(--surface-hover);
+  color: var(--accent);
+}
+
+.error-detail-trigger svg {
+  width: 14px;
+  height: 14px;
+}
+
+.error-modal {
+  width: min(650px, 100%);
+  background: rgba(255, 255, 255, 0.98);
+}
+
+.error-modal-body {
+  padding-top: 0;
+}
+
+.error-summary {
+  min-height: 88px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.error-summary-icon {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.error-summary-icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+.error-summary span,
+.error-summary strong {
+  display: block;
+}
+
+.error-summary div > span {
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.error-summary strong {
+  margin-top: 4px;
+  font-size: 15px;
+}
+
+.error-detail-grid {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-bottom: 1px solid var(--line);
+}
+
+.error-detail-grid > div {
+  min-width: 0;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.error-detail-grid > div:nth-child(odd) {
+  padding-right: 18px;
+  border-right: 1px solid var(--line);
+}
+
+.error-detail-grid > div:nth-child(even) {
+  padding-left: 18px;
+}
+
+.error-detail-grid > div:nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+
+.error-detail-grid dt {
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.error-detail-grid dd {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.error-reason {
+  padding-top: 16px;
+}
+
+.error-reason h3 {
+  margin: 0;
+  font-size: 11px;
+}
+
+.error-reason p {
+  margin: 8px 0 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--danger);
+  color: var(--ink-soft);
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.error-modal .modal-foot {
+  justify-content: space-between;
+}
+
+@media (max-width: 560px) {
+  .error-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .error-detail-grid > div,
+  .error-detail-grid > div:nth-child(odd),
+  .error-detail-grid > div:nth-child(even) {
+    padding: 12px 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .error-detail-grid > div:nth-last-child(2) {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .error-detail-grid > div:last-child {
+    border-bottom: 0;
+  }
+}

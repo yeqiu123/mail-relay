@@ -90,6 +90,9 @@ class Store:
                 last_synced_uid       INTEGER,
                 last_error            TEXT,
                 last_mail_error       TEXT,
+                last_error_code       TEXT,
+                last_error_source     TEXT,
+                last_error_at         INTEGER,
                 created_at            INTEGER NOT NULL,
                 updated_at            INTEGER NOT NULL,
                 FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -569,6 +572,12 @@ class Store:
                     connection.execute(
                         "ALTER TABLE accounts ADD COLUMN full_refresh_pending INTEGER NOT NULL DEFAULT 0"
                     )
+                if "last_error_code" not in account_columns:
+                    connection.execute("ALTER TABLE accounts ADD COLUMN last_error_code TEXT")
+                if "last_error_source" not in account_columns:
+                    connection.execute("ALTER TABLE accounts ADD COLUMN last_error_source TEXT")
+                if "last_error_at" not in account_columns:
+                    connection.execute("ALTER TABLE accounts ADD COLUMN last_error_at INTEGER")
 
             # 旧版本将 IMAP 错误写入通用错误字段，升级后保留为收件箱读取异常。
             connection.execute(
@@ -766,6 +775,29 @@ class Store:
                 """
             )
 
+            # 为旧数据补齐当前异常的结构化信息，历史异常正文保持不变。
+            connection.execute(
+                """
+                UPDATE accounts
+                SET last_error_code = COALESCE(last_error_code, 'legacy_error'),
+                    last_error_source = COALESCE(
+                        last_error_source,
+                        CASE WHEN last_mail_error IS NOT NULL THEN 'imap' ELSE 'token' END
+                    ),
+                    last_error_at = COALESCE(last_error_at, updated_at)
+                WHERE COALESCE(last_mail_error, last_error) IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                UPDATE accounts
+                SET last_error_code = NULL,
+                    last_error_source = NULL,
+                    last_error_at = NULL
+                WHERE last_mail_error IS NULL AND last_error IS NULL
+                """
+            )
+
     def health_check(self) -> None:
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
@@ -901,6 +933,7 @@ class Store:
     @staticmethod
     def _public_account(row: sqlite3.Row) -> dict[str, Any]:
         mail_error = row["last_mail_error"] if "last_mail_error" in row.keys() else None
+        current_error = mail_error or row["last_error"]
         full_refresh_pending = bool(
             row["full_refresh_pending"]
             if "full_refresh_pending" in row.keys()
@@ -921,8 +954,11 @@ class Store:
             "next_refresh_at": row["next_refresh_at"],
             "last_mail_at": row["last_mail_at"],
             "last_archive_sync_at": row["last_archive_sync_at"] if "last_archive_sync_at" in row.keys() else None,
-            "last_error": mail_error or row["last_error"],
+            "last_error": current_error,
             "last_mail_error": mail_error,
+            "last_error_code": row["last_error_code"] if current_error else None,
+            "last_error_source": row["last_error_source"] if current_error else None,
+            "last_error_at": row["last_error_at"] if current_error else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -961,7 +997,10 @@ class Store:
                             access_token_cipher = NULL, access_expires_at = NULL,
                             status = 'pending', full_refresh_pending = 0,
                             last_refresh_at = NULL,
-                            next_refresh_at = ?, last_error = NULL, updated_at = ?
+                            next_refresh_at = ?, last_error = NULL,
+                            last_mail_error = NULL, last_error_code = NULL,
+                            last_error_source = NULL, last_error_at = NULL,
+                            updated_at = ?
                         WHERE id = ? AND owner_id = ?
                         """,
                         (
@@ -1313,6 +1352,9 @@ class Store:
                     last_archive_sync_at = ?, last_mail_at = ?,
                     last_error = CASE WHEN status = 'invalid' THEN last_error ELSE NULL END,
                     last_mail_error = NULL,
+                    last_error_code = CASE WHEN status = 'invalid' THEN last_error_code ELSE NULL END,
+                    last_error_source = CASE WHEN status = 'invalid' THEN last_error_source ELSE NULL END,
+                    last_error_at = CASE WHEN status = 'invalid' THEN last_error_at ELSE NULL END,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -1456,7 +1498,11 @@ class Store:
                     imap_uid_validity = ?, last_synced_uid = ?,
                     last_archive_sync_at = ?, last_mail_at = ?,
                     last_error = CASE WHEN status = 'invalid' THEN last_error ELSE NULL END,
-                    last_mail_error = NULL, updated_at = ?
+                    last_mail_error = NULL,
+                    last_error_code = CASE WHEN status = 'invalid' THEN last_error_code ELSE NULL END,
+                    last_error_source = CASE WHEN status = 'invalid' THEN last_error_source ELSE NULL END,
+                    last_error_at = CASE WHEN status = 'invalid' THEN last_error_at ELSE NULL END,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -2325,6 +2371,15 @@ class Store:
                         last_mail_error = CASE
                             WHEN status = 'invalid' THEN last_mail_error ELSE NULL
                         END,
+                        last_error_code = CASE
+                            WHEN status = 'invalid' THEN last_error_code ELSE NULL
+                        END,
+                        last_error_source = CASE
+                            WHEN status = 'invalid' THEN last_error_source ELSE NULL
+                        END,
+                        last_error_at = CASE
+                            WHEN status = 'invalid' THEN last_error_at ELSE NULL
+                        END,
                         updated_at = ?
                     WHERE owner_id = ? AND id IN ({placeholders})
                     """,
@@ -2630,6 +2685,15 @@ class Store:
                     last_mail_error = CASE
                         WHEN status = 'invalid' THEN last_mail_error ELSE NULL
                     END,
+                    last_error_code = CASE
+                        WHEN status = 'invalid' THEN last_error_code ELSE NULL
+                    END,
+                    last_error_source = CASE
+                        WHEN status = 'invalid' THEN last_error_source ELSE NULL
+                    END,
+                    last_error_at = CASE
+                        WHEN status = 'invalid' THEN last_error_at ELSE NULL
+                    END,
                     updated_at = ?
                 WHERE id IN ({placeholders})
                 """,
@@ -2644,7 +2708,11 @@ class Store:
                 SET status = CASE WHEN status = 'invalid' THEN status ELSE 'active' END,
                     full_refresh_pending = 0,
                     last_error = CASE WHEN status = 'invalid' THEN last_error ELSE NULL END,
-                    last_mail_error = NULL, updated_at = ?
+                    last_mail_error = NULL,
+                    last_error_code = CASE WHEN status = 'invalid' THEN last_error_code ELSE NULL END,
+                    last_error_source = CASE WHEN status = 'invalid' THEN last_error_source ELSE NULL END,
+                    last_error_at = CASE WHEN status = 'invalid' THEN last_error_at ELSE NULL END,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (int(time.time()), account_id),
@@ -2656,21 +2724,28 @@ class Store:
         message: str,
         mail_error: bool = False,
         permanent: bool = False,
+        code: str = "refresh_error",
+        source: str = "system",
     ) -> None:
+        now = int(time.time())
         with self._write_lock, self._connect() as connection:
             connection.execute(
                 """
                 UPDATE accounts
                 SET status = ?, full_refresh_pending = 0,
                     last_error = ?,
-                    last_mail_error = ?, updated_at = ?
+                    last_mail_error = ?, last_error_code = ?,
+                    last_error_source = ?, last_error_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     "invalid" if permanent else "error",
                     message[:600],
                     message[:600] if mail_error else None,
-                    int(time.time()),
+                    code[:100],
+                    source[:30],
+                    now,
+                    now,
                     account_id,
                 ),
             )
@@ -2692,6 +2767,9 @@ class Store:
                     SET access_token_cipher = ?, access_expires_at = ?,
                         refresh_token_cipher = ?, status = 'active',
                         last_refresh_at = ?, next_refresh_at = ?, last_error = NULL,
+                        last_error_code = CASE WHEN last_mail_error IS NULL THEN NULL ELSE last_error_code END,
+                        last_error_source = CASE WHEN last_mail_error IS NULL THEN NULL ELSE last_error_source END,
+                        last_error_at = CASE WHEN last_mail_error IS NULL THEN NULL ELSE last_error_at END,
                         updated_at = ?
                     WHERE id = ?
                     """,
@@ -2711,7 +2789,11 @@ class Store:
                     UPDATE accounts
                     SET access_token_cipher = ?, access_expires_at = ?,
                         status = 'active', last_refresh_at = ?, next_refresh_at = ?,
-                        last_error = NULL, updated_at = ?
+                        last_error = NULL,
+                        last_error_code = CASE WHEN last_mail_error IS NULL THEN NULL ELSE last_error_code END,
+                        last_error_source = CASE WHEN last_mail_error IS NULL THEN NULL ELSE last_error_source END,
+                        last_error_at = CASE WHEN last_mail_error IS NULL THEN NULL ELSE last_error_at END,
+                        updated_at = ?
                     WHERE id = ?
                     """,
                     (
@@ -2730,16 +2812,31 @@ class Store:
         status: str,
         message: str,
         next_refresh_at: int | None,
+        code: str = "token_error",
+        source: str = "token",
     ) -> None:
         now = int(time.time())
         with self._write_lock, self._connect() as connection:
             connection.execute(
                 """
                 UPDATE accounts
-                SET status = ?, last_error = ?, next_refresh_at = ?, updated_at = ?
+                SET status = ?, last_error = ?, next_refresh_at = ?,
+                    last_error_code = CASE WHEN last_mail_error IS NULL THEN ? ELSE last_error_code END,
+                    last_error_source = CASE WHEN last_mail_error IS NULL THEN ? ELSE last_error_source END,
+                    last_error_at = CASE WHEN last_mail_error IS NULL THEN ? ELSE last_error_at END,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (status, message[:600], next_refresh_at, now, account_id),
+                (
+                    status,
+                    message[:600],
+                    next_refresh_at,
+                    code[:100],
+                    source[:30],
+                    now,
+                    now,
+                    account_id,
+                ),
             )
 
     def add_refresh_log(
@@ -2866,15 +2963,31 @@ class Store:
                 (value, int(time.time()), account_id),
             )
 
-    def set_mail_error(self, account_id: int, message: str) -> None:
+    def set_mail_error(
+        self,
+        account_id: int,
+        message: str,
+        code: str = "imap_error",
+        source: str = "imap",
+    ) -> None:
+        now = int(time.time())
         with self._write_lock, self._connect() as connection:
             connection.execute(
                 """
                 UPDATE accounts
-                SET last_error = ?, last_mail_error = ?, updated_at = ?
+                SET last_error = ?, last_mail_error = ?, last_error_code = ?,
+                    last_error_source = ?, last_error_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (message[:600], message[:600], int(time.time()), account_id),
+                (
+                    message[:600],
+                    message[:600],
+                    code[:100],
+                    source[:30],
+                    now,
+                    now,
+                    account_id,
+                ),
             )
 
     def get_settings(self) -> dict[str, Any]:

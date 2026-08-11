@@ -24,6 +24,7 @@ const state = {
   shareToken: "",
   shareExpiresAt: null,
   shareLastAccessAt: null,
+  errorAccountId: null,
   oauthClientId: "",
   oauthFlowId: "",
   confirmResolve: null,
@@ -93,6 +94,37 @@ function formatTime(timestamp) {
     minute: "2-digit",
     hour12: false,
   }).format(date);
+}
+
+function accountErrorDetails(account) {
+  const source = String(account.last_error_source || "");
+  const code = String(account.last_error_code || "legacy_error");
+  const sourceLabels = {
+    token: "令牌刷新",
+    imap: "收件箱读取",
+    system: "系统任务",
+  };
+  let type = "刷新异常";
+  if (account.status === "invalid") type = "授权已失效";
+  else if (code === "network_error") type = "网络异常";
+  else if (code === "imap_authentication_failed") type = "IMAP 登录失败";
+  else if (source === "imap") type = "收件箱读取失败";
+  else if (source === "token") type = "令牌刷新失败";
+  else if (source === "system") type = "系统任务异常";
+
+  let lastSuccessAt = Math.max(
+    Number(account.last_refresh_at || 0),
+    Number(account.last_mail_at || 0),
+  );
+  if (source === "token") lastSuccessAt = Number(account.last_refresh_at || 0);
+  if (source === "imap") lastSuccessAt = Number(account.last_mail_at || 0);
+
+  return {
+    type,
+    source: sourceLabels[source] || "未记录",
+    code: code === "legacy_error" ? "未记录" : code,
+    lastSuccessAt,
+  };
 }
 
 function detailFrom(data, fallback) {
@@ -384,9 +416,12 @@ function renderAccounts(result) {
   } else {
     tbody.innerHTML = result.items.map((account) => {
       const meta = statusMeta[account.status] || statusMeta.error;
-      const title = account.last_error ? ` title="${escapeHtml(account.last_error)}"` : "";
       const checked = state.selected.has(account.id) ? " checked" : "";
       const provider = account.client_id;
+      const errorAction = account.last_error ? `
+              <button class="error-detail-trigger" type="button" data-action="error-detail" data-id="${account.id}" aria-label="查看异常详情" title="查看异常详情">
+                <i data-lucide="circle-help"></i>
+              </button>` : "";
       const refreshAction = `
               <button class="row-action" type="button" data-action="refresh" data-id="${account.id}" aria-label="完整校验邮箱" title="完整校验邮箱">
                 <i data-lucide="rotate-cw"></i>
@@ -401,7 +436,12 @@ function renderAccounts(result) {
             </button>
             <small title="${escapeHtml(provider)}">${escapeHtml(provider)}</small>
           </td>
-          <td><span class="status ${meta.className}"${title}>${meta.label}</span></td>
+          <td>
+            <div class="status-cell-content">
+              <span class="status ${meta.className}">${meta.label}</span>
+              ${errorAction}
+            </div>
+          </td>
           <td class="time-cell">${formatTime(account.last_refresh_at)}</td>
           <td class="time-cell">${formatTime(account.next_refresh_at)}</td>
           <td class="time-cell">${formatTime(account.last_mail_at)}</td>
@@ -937,6 +977,57 @@ function openShareLink(email, url, link = {}) {
 
 function closeShareLink() {
   showOverlay($("#share-overlay"), false);
+}
+
+function openErrorDetails(account) {
+  const details = accountErrorDetails(account);
+  const status = statusMeta[account.status] || statusMeta.error;
+  state.errorAccountId = account.id;
+  $("#error-email").textContent = account.email;
+  $("#error-type").textContent = details.type;
+  $("#error-status").textContent = status.label;
+  $("#error-source").textContent = details.source;
+  $("#error-code").textContent = details.code;
+  $("#error-at").textContent = formatTime(account.last_error_at);
+  $("#error-success-at").textContent = formatTime(details.lastSuccessAt);
+  $("#error-next-at").textContent = formatTime(account.next_refresh_at);
+  $("#error-reason").textContent = account.last_error || "未记录异常原因";
+  showOverlay($("#error-overlay"), true);
+  window.setTimeout(() => $("#close-error-details").focus(), 80);
+}
+
+function closeErrorDetails() {
+  state.errorAccountId = null;
+  showOverlay($("#error-overlay"), false);
+}
+
+async function copyErrorDetails() {
+  const account = state.accounts.find((item) => item.id === state.errorAccountId);
+  if (!account) return;
+  const details = accountErrorDetails(account);
+  const status = statusMeta[account.status] || statusMeta.error;
+  const content = [
+    `邮箱：${account.email}`,
+    `状态：${status.label}`,
+    `异常类型：${details.type}`,
+    `异常来源：${details.source}`,
+    `错误代码：${details.code}`,
+    `发生时间：${formatTime(account.last_error_at)}`,
+    `异常原因：${account.last_error || "未记录"}`,
+  ].join("\n");
+  try {
+    await navigator.clipboard.writeText(content);
+    toast("异常信息已复制");
+  } catch (error) {
+    toast("复制失败，请检查浏览器权限", "error");
+  }
+}
+
+async function retryErrorAccount(event) {
+  const accountId = state.errorAccountId;
+  if (!accountId) return;
+  closeErrorDetails();
+  await queueRefresh([accountId], { button: event.currentTarget, showLabel: false });
 }
 
 async function copyShareLink() {
@@ -1558,6 +1649,7 @@ function bindEvents() {
     if (button.dataset.action === "copy-email") copyEmailAddress(account.email);
     if (button.dataset.action === "mail") openDrawer(account);
     if (button.dataset.action === "share") generateShareLink(id);
+    if (button.dataset.action === "error-detail") openErrorDetails(account);
     if (button.dataset.action === "refresh") queueRefresh([id], { button, showLabel: false });
     if (button.dataset.action === "delete") deleteAccounts([id]);
   });
@@ -1602,6 +1694,12 @@ function bindEvents() {
   $("#copy-share-link").addEventListener("click", copyShareLink);
   $("#save-share-expiry").addEventListener("click", saveShareExpiry);
   $("#revoke-share-link").addEventListener("click", revokeShareLink);
+  $("#close-error-details").addEventListener("click", closeErrorDetails);
+  $("#error-overlay").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeErrorDetails();
+  });
+  $("#copy-error-details").addEventListener("click", copyErrorDetails);
+  $("#retry-error-account").addEventListener("click", retryErrorAccount);
   $("#target-search").addEventListener("input", (event) => {
     state.targetSearch = event.currentTarget.value.trim();
     renderTargets(state.targets);
@@ -1665,6 +1763,7 @@ function bindEvents() {
     closeImport();
     closeOAuthModal();
     closeShareLink();
+    closeErrorDetails();
     closeTargetModal();
     closeTargetTagsModal();
     closeDrawer();

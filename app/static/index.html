@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Mail Relay</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260806-neutral-overlay">
+  <link rel="stylesheet" href="/static/styles.css?v=20260811-error-details">
   <script defer src="/static/lucide.min.js?v=0.468.0"></script>
-  <script defer src="/static/app.js?v=20260810-security-fixes"></script>
+  <script defer src="/static/app.js?v=20260811-error-details"></script>
 </head>
 <body>
   <div class="boot-screen" id="boot-screen" aria-label="正在加载">
@@ -566,6 +566,51 @@
           </button>
         </div>
       </div>
+    </section>
+  </div>
+
+  <div class="overlay hidden" id="error-overlay" aria-hidden="true">
+    <section class="modal error-modal" role="dialog" aria-modal="true" aria-labelledby="error-details-title">
+      <header class="modal-head">
+        <div>
+          <h2 id="error-details-title">异常详情</h2>
+          <p id="error-email"></p>
+        </div>
+        <button class="icon-button" id="close-error-details" type="button" aria-label="关闭" title="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="modal-body error-modal-body">
+        <div class="error-summary">
+          <span class="error-summary-icon"><i data-lucide="circle-alert"></i></span>
+          <div>
+            <span>当前异常</span>
+            <strong id="error-type"></strong>
+          </div>
+        </div>
+        <dl class="error-detail-grid">
+          <div><dt>账户状态</dt><dd id="error-status"></dd></div>
+          <div><dt>异常来源</dt><dd id="error-source"></dd></div>
+          <div><dt>错误代码</dt><dd id="error-code"></dd></div>
+          <div><dt>发生时间</dt><dd id="error-at"></dd></div>
+          <div><dt>上次成功</dt><dd id="error-success-at"></dd></div>
+          <div><dt>下次计划刷新</dt><dd id="error-next-at"></dd></div>
+        </dl>
+        <section class="error-reason" aria-labelledby="error-reason-title">
+          <h3 id="error-reason-title">异常原因</h3>
+          <p id="error-reason"></p>
+        </section>
+      </div>
+      <footer class="modal-foot">
+        <button class="button" id="copy-error-details" type="button">
+          <i data-lucide="copy"></i>
+          <span>复制异常信息</span>
+        </button>
+        <button class="button primary" id="retry-error-account" type="button">
+          <i data-lucide="rotate-cw"></i>
+          <span>重新校验</span>
+        </button>
+      </footer>
     </section>
   </div>
 
