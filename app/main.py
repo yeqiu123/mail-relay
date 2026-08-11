@@ -261,7 +261,7 @@ def public_shell(title: str, body: str, *, wide: bool = False, status: str = "å…
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <link rel="stylesheet" href="/static/public-mail.css?v=20260805-durable-refresh">
+  <link rel="stylesheet" href="/static/public-mail.css?v=20260811-mobile-responsive">
   <script defer src="/static/public-mail.js?v=20260810-refresh-timeout"></script>
   <title>{escape(title)}</title>
 </head>

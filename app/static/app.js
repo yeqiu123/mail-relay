@@ -427,25 +427,25 @@ function renderAccounts(result) {
                 <i data-lucide="rotate-cw"></i>
               </button>`;
       return `
-        <tr data-account-id="${account.id}">
-          <td><input class="checkbox account-checkbox" type="checkbox" data-id="${account.id}" aria-label="选择 ${escapeHtml(account.email)}"${checked}></td>
-          <td class="email-cell">
+        <tr class="data-row account-row" data-account-id="${account.id}">
+          <td class="mobile-select-cell" data-label="选择"><input class="checkbox account-checkbox" type="checkbox" data-id="${account.id}" aria-label="选择 ${escapeHtml(account.email)}"${checked}></td>
+          <td class="email-cell" data-label="邮箱">
             <button class="email-copy" type="button" data-action="copy-email" data-id="${account.id}" aria-label="复制 ${escapeHtml(account.email)}" title="点击复制邮箱地址">
               <strong>${escapeHtml(account.email)}</strong>
               <i data-lucide="copy"></i>
             </button>
             <small title="${escapeHtml(provider)}">${escapeHtml(provider)}</small>
           </td>
-          <td>
+          <td data-label="状态">
             <div class="status-cell-content">
               <span class="status ${meta.className}">${meta.label}</span>
               ${errorAction}
             </div>
           </td>
-          <td class="time-cell">${formatTime(account.last_refresh_at)}</td>
-          <td class="time-cell">${formatTime(account.next_refresh_at)}</td>
-          <td class="time-cell">${formatTime(account.last_mail_at)}</td>
-          <td>
+          <td class="time-cell" data-label="上次刷新">${formatTime(account.last_refresh_at)}</td>
+          <td class="time-cell" data-label="下次刷新">${formatTime(account.next_refresh_at)}</td>
+          <td class="time-cell" data-label="最近读取">${formatTime(account.last_mail_at)}</td>
+          <td class="mobile-actions-cell" data-label="操作">
             <div class="row-actions">
               <button class="row-action" type="button" data-action="mail" data-id="${account.id}" aria-label="查看收件箱" title="查看收件箱">
                 <i data-lucide="mail-open"></i>
@@ -761,19 +761,19 @@ function renderTargets(targets) {
         ? tags.map((tag) => `<span class="target-tag">${escapeHtml(tag)}</span>`).join("")
         : '<span class="target-tag-empty">—</span>';
       return `
-        <tr data-target-id="${target.id}">
-          <td class="email-cell">
+        <tr class="data-row target-row" data-target-id="${target.id}">
+          <td class="email-cell" data-label="别名邮箱">
             <button class="email-copy" type="button" data-target-action="copy-email" data-id="${target.id}" aria-label="复制 ${escapeHtml(target.email)}" title="点击复制邮箱地址">
               <strong>${escapeHtml(target.email)}</strong>
               <i data-lucide="copy"></i>
             </button>
           </td>
-          <td class="email-cell"><strong title="${escapeHtml(target.account_email)}">${escapeHtml(target.account_email)}</strong></td>
-          <td><div class="target-tag-list">${tagsHtml}</div></td>
-          <td><span class="user-count">${Number(target.message_count || 0)}</span></td>
-          <td><span class="status ${enabled ? "active" : "user-disabled"}">${enabled ? "启用" : "已停用"}</span></td>
-          <td class="time-cell">${formatTime(target.created_at)}</td>
-          <td>
+          <td class="email-cell" data-label="归属邮箱"><strong title="${escapeHtml(target.account_email)}">${escapeHtml(target.account_email)}</strong></td>
+          <td data-label="标签"><div class="target-tag-list">${tagsHtml}</div></td>
+          <td data-label="已归档"><span class="user-count">${Number(target.message_count || 0)}</span></td>
+          <td data-label="状态"><span class="status ${enabled ? "active" : "user-disabled"}">${enabled ? "启用" : "已停用"}</span></td>
+          <td class="time-cell" data-label="创建时间">${formatTime(target.created_at)}</td>
+          <td class="mobile-actions-cell" data-label="操作">
             <div class="row-actions">
               <button class="row-action" type="button" data-target-action="share" data-id="${target.id}" aria-label="生成共享链接" title="生成共享链接">
                 <i data-lucide="link"></i>
@@ -1239,11 +1239,11 @@ function renderLogs(result) {
           ? { label: "已失效", className: "invalid" }
           : { label: "失败", className: "error" };
       return `
-        <tr>
-          <td class="email-cell"><strong title="${escapeHtml(log.email)}">${escapeHtml(log.email)}</strong></td>
-          <td><span class="status ${resultMeta.className}">${resultMeta.label}</span></td>
-          <td class="message-cell" title="${escapeHtml(log.message || "")}">${escapeHtml(log.message || "—")}</td>
-          <td class="time-cell">${formatTime(log.created_at)}</td>
+        <tr class="data-row log-row">
+          <td class="email-cell" data-label="邮箱"><strong title="${escapeHtml(log.email)}">${escapeHtml(log.email)}</strong></td>
+          <td data-label="结果"><span class="status ${resultMeta.className}">${resultMeta.label}</span></td>
+          <td class="message-cell" data-label="详情" title="${escapeHtml(log.message || "")}">${escapeHtml(log.message || "—")}</td>
+          <td class="time-cell" data-label="执行时间">${formatTime(log.created_at)}</td>
         </tr>
       `;
     }).join("");
@@ -1319,13 +1319,13 @@ function renderUsers(users) {
           </button>
         `;
       return `
-        <tr data-user-id="${user.id}">
-          <td class="email-cell"><strong title="${escapeHtml(user.username)}">${escapeHtml(user.username)}</strong></td>
-          <td><span class="user-role">${isAdmin ? "管理员" : "普通用户"}</span></td>
-          <td><span class="status ${enabled ? "active" : "user-disabled"}">${enabled ? "启用" : "已停用"}</span></td>
-          <td><span class="user-count">${user.account_count}</span></td>
-          <td class="time-cell">${formatTime(user.created_at)}</td>
-          <td><div class="row-actions">${actions}</div></td>
+        <tr class="data-row user-row" data-user-id="${user.id}">
+          <td class="email-cell" data-label="用户名"><strong title="${escapeHtml(user.username)}">${escapeHtml(user.username)}</strong></td>
+          <td data-label="角色"><span class="user-role">${isAdmin ? "管理员" : "普通用户"}</span></td>
+          <td data-label="状态"><span class="status ${enabled ? "active" : "user-disabled"}">${enabled ? "启用" : "已停用"}</span></td>
+          <td data-label="邮箱数量"><span class="user-count">${user.account_count}</span></td>
+          <td class="time-cell" data-label="创建时间">${formatTime(user.created_at)}</td>
+          <td class="mobile-actions-cell" data-label="操作"><div class="row-actions">${actions}</div></td>
         </tr>
       `;
     }).join("");
