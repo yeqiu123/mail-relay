@@ -115,6 +115,11 @@ class AccountIdsPayload(BaseModel):
     ids: list[int] = Field(default_factory=list, max_length=5000)
 
 
+class AccountRefreshPayload(AccountIdsPayload):
+    search: str = Field(default="", max_length=200)
+    status: str = Field(default="", max_length=20)
+
+
 class ShareLinkPayload(BaseModel):
     account_id: int = Field(ge=1)
 
@@ -883,10 +888,18 @@ async def import_accounts(
 
 @app.post("/api/accounts/refresh")
 async def refresh_accounts(
-    payload: AccountIdsPayload,
+    payload: AccountRefreshPayload,
     user: CurrentUser,
 ) -> dict[str, str | int | bool]:
-    account_ids = store.refreshable_ids(int(user["id"]), payload.ids or None)
+    normalized_status = payload.status.strip().lower()
+    if normalized_status and normalized_status not in VALID_STATUSES:
+        raise HTTPException(status_code=422, detail="状态筛选值无效")
+    account_ids = store.refreshable_ids(
+        int(user["id"]),
+        payload.ids or None,
+        search=payload.search.strip(),
+        status=normalized_status,
+    )
     try:
         return full_refresh_coordinator.start_job(int(user["id"]), account_ids)
     except ValueError as exc:

@@ -594,9 +594,15 @@ async function queueRefresh(ids, { button = $("#refresh-button"), showLabel = tr
   showRefreshLoading({ preparing: true });
   setButtonBusy(button, true, showLabel ? "校验中" : "");
   try {
+    const payload = { ids };
+    if (!ids.length) {
+      // 未选择具体邮箱时，刷新范围取当前页面筛选条件，覆盖全部分页。
+      payload.search = $("#account-search").value.trim();
+      payload.status = $("#status-filter").value;
+    }
     const started = await api("/api/accounts/refresh", {
       method: "POST",
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify(payload),
     });
     updateRefreshLoading(started);
     const result = await waitForRefreshJob(started);

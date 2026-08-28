@@ -2649,23 +2649,38 @@ class Store:
         self,
         owner_id: int,
         account_ids: Iterable[int] | None = None,
+        search: str = "",
+        status: str = "",
     ) -> list[int]:
         ids = [int(account_id) for account_id in account_ids or []]
+        where = ["owner_id = ?", "provider = 'outlook'"]
+        params: list[Any] = [owner_id]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            where.append(f"id IN ({placeholders})")
+            params.extend(ids)
+        else:
+            if search:
+                where.append("email LIKE ?")
+                params.append(f"%{search}%")
+            if status == "active":
+                where.append(
+                    "status = 'active' AND last_mail_error IS NULL AND full_refresh_pending = 0"
+                )
+            elif status == "error":
+                where.append(
+                    "(status = 'error' OR last_mail_error IS NOT NULL) AND full_refresh_pending = 0"
+                )
+            elif status == "pending":
+                where.append("(status = 'pending' OR full_refresh_pending = 1)")
+            elif status:
+                where.append("status = ?")
+                params.append(status)
         with self._connect() as connection:
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                rows = connection.execute(
-                    f"""
-                    SELECT id FROM accounts
-                    WHERE owner_id = ? AND provider = 'outlook' AND id IN ({placeholders})
-                    """,
-                    [owner_id, *ids],
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    "SELECT id FROM accounts WHERE owner_id = ? AND provider = 'outlook'",
-                    (owner_id,),
-                ).fetchall()
+            rows = connection.execute(
+                f"SELECT id FROM accounts WHERE {' AND '.join(where)}",
+                params,
+            ).fetchall()
         return [int(row["id"]) for row in rows]
 
     def mark_full_refresh_pending(self, account_ids: Iterable[int]) -> None:
